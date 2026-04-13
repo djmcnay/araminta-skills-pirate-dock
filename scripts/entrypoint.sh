@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Ensure env vars are exported for Jackett (bubuntux init may not pass them)
+export HOME="${HOME:-/root}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-/root/.config}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-/root/.local/share}"
+
 echo "━━━ Pirate Dock v2 ━━━"
 echo "Base: bubuntux/nordvpn"
 echo "API:  http://0.0.0.0:9876"
 echo "Jackett: http://0.0.0.0:${JACKETT_PORT:-9118}"
+echo "HOME=$HOME"
 
 # Wait for NordVPN daemon
 for i in $(seq 1 30); do

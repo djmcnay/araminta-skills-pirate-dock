@@ -38,6 +38,9 @@ RUN mkdir -p /app /downloads /data
 WORKDIR /app
 COPY scripts/ /app/scripts/
 
+# Copy server.py to app root so uvicorn can import it
+COPY scripts/server.py /app/server.py
+
 # ── Volumes & ports ──────────────────────────────────────────
 VOLUME /downloads /data
 EXPOSE 9876

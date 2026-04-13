@@ -1,0 +1,619 @@
+"""
+Pirate Dock — API Server
+
+Architecture v2: NO browser. NO Playwright. NO Chromium.
+
+Phase 1: Anna's Archive — direct MD5-based downloads via mirrors
+Phase 2: Torrent search via Jackett (Torznab API) + aria2
+
+All traffic routes through NordVPN.
+"""
+
+import os
+import json
+import asyncio
+import subprocess
+import signal
+from pathlib import Path
+from contextlib import asynccontextmanager
+from urllib.parse import quote
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+import httpx
+
+# ── Config ───────────────────────────────────────────────────
+DOWNLOAD_DIR = Path("/downloads")
+DATA_DIR = Path("/data")
+STATE_DIR = Path(os.getenv("XDG_DATA_HOME", "/root/.local/share")) / "pirate-dock"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+JACKETT_PORT = int(os.getenv("JACKETT_PORT", "9118"))
+JACKETT_BIN = "/opt/jackett/jackett"
+JACKETT_API_KEY = os.getenv("JACKETT_API_KEY", "")  # Set after Jackett first run
+
+# Anna's Archive mirrors (tried in order)
+ANNAS_MIRRORS = [
+    "https://annas-archive.gl",
+    "https://annas-archive.pk",
+    "https://annas-archive.gd",
+]
+
+# ── Models ───────────────────────────────────────────────────
+class VpnConnectRequest(BaseModel):
+    country: str = "South_Africa"
+    server: str | None = None
+
+class AnnaDownloadRequest(BaseModel):
+    md5: str
+    optional_name: str | None = None
+    mirror: str | None = None
+
+class AnnaSearchRequest(BaseModel):
+    query: str
+    mirror: str | None = None
+
+class TorrentMagnetRequest(BaseModel):
+    magnet: str
+    optional_name: str | None = None
+
+class JackettSearchRequest(BaseModel):
+    query: str
+    indexer: str = "all"  # "all" searches all configured indexers
+
+class UfcWatchRequest(BaseModel):
+    event: str  # e.g. "UFC 327"
+    quality: str = "1080"  # preferred quality
+    poll_interval: int = 300  # seconds between polls
+
+# ── VPN helpers ──────────────────────────────────────────────
+def _nordvpn(cmd: str) -> str:
+    r = subprocess.run(
+        f"nordvpn {cmd}", shell=True,
+        capture_output=True, text=True, timeout=30
+    )
+    return (r.stdout + r.stderr).strip()
+
+def vpn_status() -> dict:
+    out = _nordvpn("status")
+    connected = "Connected" in out
+    ip = ""
+    country = ""
+    for line in out.splitlines():
+        if line.startswith("IP:"):
+            ip = line.split(":", 1)[1].strip()
+        if line.startswith("Country:"):
+            country = line.split(":", 1)[1].strip()
+    return {"connected": connected, "ip": ip, "country": country, "raw": out}
+
+def vpn_check():
+    """Raise if VPN is not connected."""
+    s = vpn_status()
+    if not s["connected"]:
+        raise HTTPException(
+            status_code=503,
+            detail=f"VPN not connected. Use POST /vpn/connect first. Status: {s['raw']}"
+        )
+
+# ── Jackett helpers ──────────────────────────────────────────
+_jackett_proc = None
+
+def _start_jackett():
+    """Start Jackett as background process."""
+    global _jackett_proc
+    if _jackett_proc and _jackett_proc.poll() is None:
+        return  # already running
+
+    jackett_dir = DATA_DIR / "jackett"
+    jackett_dir.mkdir(parents=True, exist_ok=True)
+
+    _jackett_proc = subprocess.Popen(
+        [JACKETT_BIN, "--NoRestart", "--DataFolder", str(jackett_dir)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        preexec_fn=os.setsid,
+    )
+
+    # Wait for Jackett to be ready
+    for i in range(30):
+        try:
+            r = httpx.get(f"http://127.0.0.1:{JACKETT_PORT}/api/v2.0/indexers", timeout=2)
+            if r.status_code == 200:
+                return True
+        except Exception:
+            pass
+        import time; time.sleep(1)
+    return False
+
+def _jackett_url(path: str = "") -> str:
+    base = f"http://127.0.0.1:{JACKETT_PORT}"
+    key_param = f"apikey={JACKETT_API_KEY}" if JACKETT_API_KEY else ""
+    sep = "&" if "?" in path else "?"
+    return f"{base}{path}{sep}{key_param}"
+
+def _jackett_api_key() -> str | None:
+    """Get Jackett API key from its config file."""
+    keyfile = DATA_DIR / "jackett" / "appsettings.json"
+    if keyfile.exists():
+        try:
+            cfg = json.loads(keyfile.read_text())
+            return cfg.get("APIKey")
+        except Exception:
+            pass
+    return None
+
+# ── App lifecycle ────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    _start_jackett()
+    # Auto-detect Jackett API key if not set
+    global JACKETT_API_KEY
+    if not JACKETT_API_KEY:
+        JACKETT_API_KEY = _jackett_api_key() or ""
+    yield
+    # Shutdown
+    if _jackett_proc and _jackett_proc.poll() is None:
+        os.killpg(os.getpgid(_jackett_proc.pid), signal.SIGTERM)
+
+app = FastAPI(title="Pirate Dock", version="2.0", lifespan=lifespan)
+
+# ── VPN endpoints ────────────────────────────────────────────
+@app.get("/status")
+async def get_status():
+    s = vpn_status()
+    s["jackett_running"] = _jackett_proc is not None and _jackett_proc.poll() is None
+    s["jackett_port"] = JACKETT_PORT
+    s["jackett_api_key_set"] = bool(JACKETT_API_KEY)
+    return s
+
+@app.post("/vpn/connect")
+async def vpn_connect(req: VpnConnectRequest):
+    if req.server:
+        result = _nordvpn(f"connect {req.server}")
+    else:
+        result = _nordvpn(f"connect --group P2P '{req.country}'")
+    return {"result": result, "status": vpn_status()}
+
+@app.post("/vpn/disconnect")
+async def vpn_disconnect():
+    return {"result": _nordvpn("disconnect")}
+
+# ── Anna's Archive — Search ──────────────────────────────────
+@app.get("/search/annas-archive")
+async def search_annas_get(q: str, mirror: str | None = None):
+    """Search Anna's Archive (GET for convenience)."""
+    return await _search_annas(q, mirror)
+
+@app.post("/search/annas-archive")
+async def search_annas_post(req: AnnaSearchRequest):
+    """Search Anna's Archive."""
+    return await _search_annas(req.query, req.mirror)
+
+async def _search_annas(query: str, mirror: str | None = None):
+    """Scrape Anna's Archive search results page."""
+    mirrors = [mirror] if mirror else ANNAS_MIRRORS
+    search_url_template = "{}/s?q={}"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Accept": "text/html,application/xhtml+xml",
+    }
+
+    for base in mirrors:
+        url = search_url_template.format(base, quote(query))
+        try:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code != 200:
+                    continue
+
+                results = _parse_annas_search(resp.text, base)
+                if results:
+                    return {
+                        "query": query,
+                        "mirror": base,
+                        "results": results[:20],  # Cap at 20
+                        "count": len(results),
+                    }
+        except Exception as e:
+            continue
+
+    return {
+        "query": query,
+        "results": [],
+        "count": 0,
+        "error": "No results from any mirror (all mirrors may be down)",
+    }
+
+def _parse_annas_search(html: str, base_url: str) -> list:
+    """Parse Anna's Archive search results HTML."""
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "lxml")
+    results = []
+
+    # Anna's Archive search results are in divs with class 'js-search-result'
+    for row in soup.select('.js-search-result, .search-result'):
+        try:
+            # Extract MD5 from the link
+            link = row.select_one('a[href*="/md5/"], a[href*="/isbn/"], a[href*="/doi/"]')
+            if not link:
+                continue
+
+            href = link.get("href", "")
+            # Extract MD5 hash from URL
+            md5 = ""
+            for part in href.split("/"):
+                if len(part) == 32 and all(c in "0123456789abcdef" for c in part):
+                    md5 = part
+                    break
+
+            # Title
+            title_el = row.select_one('.search-result-title, h3, .search-result-md5')
+            title = title_el.get_text(strip=True) if title_el else "Unknown"
+
+            # Size, format, source
+            size_el = row.select_one('.search-result-size')
+            size = size_el.get_text(strip=True) if size_el else ""
+
+            details_el = row.select_one('.search-result-right')
+            details = details_el.get_text(strip=True) if details_el else ""
+
+            # Source library (Z-Library, LibGen, etc.)
+            source_el = row.select_one('.search-result-source, .search-result-icon img')
+            source = ""
+            if source_el:
+                source = source_el.get("title", "") or source_el.get("alt", "") or source_el.get_text(strip=True)
+
+            if md5:
+                results.append({
+                    "md5": md5,
+                    "title": title,
+                    "size": size,
+                    "details": details,
+                    "source": source,
+                    "download_url": f"{base_url}/md5/{md5}",
+                })
+        except Exception:
+            continue
+
+    # Fallback: regex for MD5 hashes if structured parsing found nothing
+    if not results:
+        import re
+        md5_pattern = re.compile(r'/md5/([a-f0-9]{32})')
+        titles = re.compile(r'<div[^>]*class="[^"]*search-result[^"]*"[^>]*>.*?</div>', re.DOTALL)
+
+        seen = set()
+        for match in md5_pattern.finditer(html):
+            md5 = match.group(1)
+            if md5 not in seen:
+                seen.add(md5)
+                results.append({
+                    "md5": md5,
+                    "title": "",
+                    "size": "",
+                    "details": "",
+                    "source": "",
+                    "download_url": f"{base_url}/md5/{md5}",
+                })
+
+    return results
+
+# ── Anna's Archive — Download ────────────────────────────────
+@app.post("/download/annas-archive")
+async def download_annas(req: AnnaDownloadRequest):
+    """
+    Download a book from Anna's Archive by MD5.
+
+    Strategy:
+    1. Try to get a direct download link from the mirror
+    2. If the book is in a torrent we know about, use magnet
+    3. Otherwise, construct the page URL for reference
+
+    Without an API key, direct download from slow servers requires
+    a browser for CAPTCHA. This endpoint gives you the page URL
+    and MD5 so you can download manually, OR if the book is
+    available via a torrent mirror, it'll start the torrent download.
+    """
+    vpn_check()
+
+    md5 = req.md5
+    mirror_base = req.mirror or ANNAS_MIRRORS[0]
+
+    # The direct page URL
+    page_url = f"{mirror_base}/md5/{md5}"
+
+    # Try to fetch the page and extract any direct download links
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    }
+
+    download_info = {
+        "md5": md5,
+        "page_url": page_url,
+        "mirror": mirror_base,
+        "status": "info",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            resp = await client.get(page_url, headers=headers)
+            if resp.status_code == 200:
+                # Look for any direct download links
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(resp.text, "lxml")
+
+                # Try to find title from page
+                title_el = soup.select_one('h1, .book-title, .md5card-title')
+                if title_el:
+                    download_info["title"] = title_el.get_text(strip=True)
+
+                # Look for download buttons/links
+                for link in soup.select('a[href]'):
+                    href = link.get("href", "")
+                    text = link.get_text(strip=True).lower()
+                    if any(kw in text for kw in ["download", "pdf", "epub", "mobi", "slow"]):
+                        if href.startswith("http"):
+                            download_info.setdefault("download_links", []).append({
+                                "text": link.get_text(strip=True),
+                                "url": href,
+                            })
+
+                download_info["status"] = "page_loaded"
+    except Exception as e:
+        download_info["status"] = "page_fetch_failed"
+        download_info["error"] = str(e)
+
+    return download_info
+
+# ── Anna's Archive — Direct MD5 Download ─────────────────────
+@app.get("/download/annas-archive/{md5}")
+async def download_annas_md5(md5: str, name: str | None = None, mirror: str | None = None):
+    """Convenience: GET /download/annas-archive/{md5}?name=MyBook"""
+    req = AnnaDownloadRequest(md5=md5, optional_name=name, mirror=mirror)
+    return await download_annas(req)
+
+# ── Torrent search — Jackett ─────────────────────────────────
+@app.get("/search/torrents")
+async def search_torrents_get(q: str, indexer: str = "all"):
+    return await _search_jackett(q, indexer)
+
+@app.post("/search/torrents")
+async def search_torrents_post(req: JackettSearchRequest):
+    return await _search_jackett(req.query, req.indexer)
+
+async def _search_jackett(query: str, indexer: str = "all"):
+    """Search torrents via Jackett Torznab API."""
+    url = _jackett_url(
+        f"/api/v2.0/indexers/{indexer}/results/torznab/api"
+        f"?t=search&cat=2000&q={quote(query)}"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Jackett returned {resp.status_code}"
+                )
+
+            results = _parse_torznab(resp.text)
+            return {
+                "query": query,
+                "indexer": indexer,
+                "results": results[:20],
+                "count": len(results),
+            }
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Jackett search timed out")
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=503,
+            detail="Jackett not running. Check /status endpoint."
+        )
+
+def _parse_torznab(xml_text: str) -> list:
+    """Parse Torznab XML response into structured results."""
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(xml_text, "lxml-xml")
+    results = []
+
+    for item in soup.select("item"):
+        title = item.select_one("title")
+        link = item.select_one("link")
+        size = item.select_one("size")
+        seeders = item.select_one("seeders")
+        peers = item.select_one("peers")
+        source = item.select_one("source") or item.select_one("jackettindexer")
+
+        magnet = ""
+        for attr in item.select("enclosure, link"):
+            if attr.get("type") == "application/x-bittorrent" or \
+               attr.get("url", "").startswith("magnet:"):
+                magnet = attr.get("url", "")
+                break
+
+        # Also check torznab:attr for magnet
+        for attr in item.select("attr"):
+            if attr.get("name") == "magneturl":
+                magnet = attr.get("value", "")
+                break
+
+        results.append({
+            "title": title.get_text(strip=True) if title else "",
+            "magnet": magnet,
+            "size": int(size.get_text()) if size else 0,
+            "seeders": int(seeders.get_text()) if seeders else 0,
+            "peers": int(peers.get_text()) if peers else 0,
+            "source": source.get_text(strip=True) if source else "",
+            "link": link.get_text(strip=True) if link else "",
+        })
+
+    return results
+
+# ── Legacy search endpoints (via Jackett) ────────────────────
+@app.get("/search/piratebay")
+async def search_piratebay(q: str):
+    return await _search_jackett(q, "thepiratebay")
+
+@app.get("/search/1337x")
+async def search_1337x(q: str):
+    return await _search_jackett(q, "1337x")
+
+@app.get("/search/ext")
+async def search_ext(q: str):
+    return await _search_jackett(q, "ext")
+
+# ── Torrent download via aria2 ───────────────────────────────
+@app.post("/download/magnet")
+async def download_magnet(req: TorrentMagnetRequest):
+    """Download a torrent via aria2."""
+    vpn_check()
+
+    name_part = f" --out '{req.optional_name}'" if req.optional_name else ""
+
+    # aria2c with sensible defaults
+    cmd = (
+        f"aria2c --seed-time=0 "
+        f"--dir=/downloads "
+        f"--summary-interval=10 "
+        f"--max-connection-per-server=4 "
+        f"--split=4 "
+        f"{name_part} "
+        f"'{req.magnet}'"
+    )
+
+    r = subprocess.Popen(
+        cmd, shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    return {
+        "status": "started",
+        "magnet": req.magnet[:80] + "...",
+        "output_dir": "/downloads",
+        "pid": r.pid,
+    }
+
+# ── Download management ─────────────────────────────────────
+@app.get("/downloads/active")
+async def active_downloads():
+    """List running aria2 processes."""
+    r = subprocess.run(
+        ["pgrep", "-a", "aria2c"],
+        capture_output=True, text=True
+    )
+    return {"processes": r.stdout.strip() or "none"}
+
+@app.get("/downloads/list")
+async def list_downloads():
+    """List files in /downloads."""
+    files = []
+    if DOWNLOAD_DIR.exists():
+        for p in sorted(DOWNLOAD_DIR.iterdir()):
+            stat = p.stat()
+            files.append({
+                "name": p.name,
+                "size": stat.st_size,
+                "isDir": p.is_dir(),
+                "modified": stat.st_mtime,
+            })
+    return {"downloads": files}
+
+# ── Jackett management ───────────────────────────────────────
+@app.get("/jackett/indexers")
+async def jackett_indexers():
+    """List available Jackett indexers."""
+    url = _jackett_url("/api/v2.0/indexers")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url)
+            return resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Jackett unavailable: {e}")
+
+@app.post("/jackett/restart")
+async def jackett_restart():
+    """Restart Jackett (e.g. after config changes)."""
+    global _jackett_proc
+    if _jackett_proc and _jackett_proc.poll() is None:
+        os.killpg(os.getpgid(_jackett_proc.pid), signal.SIGTERM)
+        import time; time.sleep(2)
+    _start_jackett()
+    global JACKETT_API_KEY
+    if not JACKETT_API_KEY:
+        JACKETT_API_KEY = _jackett_api_key() or ""
+    return {"status": "restarted", "api_key_set": bool(JACKETT_API_KEY)}
+
+# ── UFC Watch (background poller) ────────────────────────────
+# Stores watch state in memory; persists across requests within process
+_watches: dict = {}
+
+@app.post("/watch/ufc")
+async def watch_ufc(req: UfcWatchRequest):
+    """Start watching for a UFC event torrent."""
+    vpn_check()
+
+    watch_key = req.event.lower().replace(" ", "_")
+
+    if watch_key in _watches:
+        return {"status": "already_watching", "event": req.event}
+
+    _watches[watch_key] = {
+        "event": req.event,
+        "quality": req.quality,
+        "found": False,
+        "best_torrent": None,
+        "polls": 0,
+    }
+
+    # Start background poller
+    asyncio.create_task(_poll_ufc(watch_key, req.event, req.quality, req.poll_interval))
+
+    return {
+        "status": "watching",
+        "event": req.event,
+        "quality": req.quality,
+        "poll_interval": req.poll_interval,
+    }
+
+@app.get("/watch/ufc")
+async def watch_ufc_status():
+    """Get status of all UFC watches."""
+    return {"watches": _watches}
+
+@app.delete("/watch/ufc/{event_key}")
+async def watch_ufc_stop(event_key: str):
+    """Stop watching for a UFC event."""
+    if event_key in _watches:
+        del _watches[event_key]
+        return {"status": "stopped", "event": event_key}
+    return {"status": "not_found"}
+
+async def _poll_ufc(key: str, event: str, quality: str, interval: int):
+    """Background poller: search for UFC event torrents periodically."""
+    while key in _watches and not _watches[key]["found"]:
+        try:
+            results = await _search_jackett(f"{event}", "all")
+            for r in results.get("results", []):
+                title = r.get("title", "").lower()
+                if event.lower().replace(" ", "") in title.replace(" ", ""):
+                    # Check quality
+                    if quality in title:
+                        if not _watches[key]["best_torrent"] or \
+                           r.get("seeders", 0) > _watches[key]["best_torrent"].get("seeders", 0):
+                            _watches[key]["best_torrent"] = r
+            _watches[key]["polls"] += 1
+        except Exception:
+            pass
+
+        if _watches[key]["best_torrent"] and _watches[key]["best_torrent"].get("seeders", 0) >= 2:
+            _watches[key]["found"] = True
+            break
+
+        await asyncio.sleep(interval)

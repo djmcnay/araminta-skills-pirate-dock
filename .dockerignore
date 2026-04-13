@@ -1,0 +1,39 @@
+# Build context bloat prevention
+# Never copy these into the image
+
+# Downloads and state
+downloads/
+*.log
+*.tmp
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker Compose (not needed inside image)
+docker-compose*.yml
+.env
+.env.*
+
+# Documentation
+README.md
+LICENSE
+docs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db

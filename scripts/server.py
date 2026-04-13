@@ -28,7 +28,7 @@ DATA_DIR = Path("/data")
 STATE_DIR = Path(os.getenv("XDG_DATA_HOME", "/root/.local/share")) / "pirate-dock"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-JACKETT_PORT = int(os.getenv("JACKETT_PORT", "9118"))
+JACKETT_PORT = int(os.getenv("JACKETT_PORT", "9118"))  # We pass --Port 9118 to Jackett
 JACKETT_BIN = "/opt/jackett/jackett"
 JACKETT_API_KEY = os.getenv("JACKETT_API_KEY", "")  # Set after Jackett first run
 
@@ -108,7 +108,8 @@ def _start_jackett():
     jackett_dir.mkdir(parents=True, exist_ok=True)
 
     _jackett_proc = subprocess.Popen(
-        [JACKETT_BIN, "--NoRestart", "--DataFolder", str(jackett_dir)],
+        [JACKETT_BIN, "--NoRestart", "--DataFolder", str(jackett_dir),
+         "--Port", "9118", "--AllowExternal", "true"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         preexec_fn=os.setsid,
@@ -133,13 +134,16 @@ def _jackett_url(path: str = "") -> str:
 
 def _jackett_api_key() -> str | None:
     """Get Jackett API key from its config file."""
-    keyfile = DATA_DIR / "jackett" / "appsettings.json"
-    if keyfile.exists():
-        try:
-            cfg = json.loads(keyfile.read_text())
-            return cfg.get("APIKey")
-        except Exception:
-            pass
+    for cfg_file in [DATA_DIR / "jackett" / "ServerConfig.json",
+                     DATA_DIR / "jackett" / "appsettings.json"]:
+        if cfg_file.exists():
+            try:
+                cfg = json.loads(cfg_file.read_text())
+                key = cfg.get("APIKey")
+                if key:
+                    return key
+            except Exception:
+                pass
     return None
 
 # ── App lifecycle ────────────────────────────────────────────

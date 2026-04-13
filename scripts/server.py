@@ -109,7 +109,7 @@ def _start_jackett():
 
     _jackett_proc = subprocess.Popen(
         [JACKETT_BIN, "--NoRestart", "--DataFolder", str(jackett_dir),
-         "--Port", "9118", "--AllowExternal", "true"],
+         "--Port", "9118", "--ListenPublic"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         preexec_fn=os.setsid,

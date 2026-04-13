@@ -30,7 +30,7 @@ RUN ARCH="${TARGETARCH}" && \
       JACKETT_URL="https://github.com/Jackett/Jackett/releases/latest/download/Jackett.Binaries.LinuxAMDx64.tar.gz"; \
     fi && \
     mkdir -p /opt/jackett && \
-    curl -sL "$JACKETT_URL" | tar xz -C /opt/jackett && \
+    curl -sL "$JACKETT_URL" | tar xz --strip-components=1 -C /opt/jackett && \
     chmod +x /opt/jackett/jackett
 
 # ── App layout ───────────────────────────────────────────────

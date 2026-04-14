@@ -1,15 +1,15 @@
 ---
 name: pirate-dock
-description: Control Pirate Dock — a bespoke Docker container for VPN-protected ebook downloads (Anna's Archive) and torrent search (Jackett). All traffic routed through NordVPN South Africa P2P.
+description: Control Pirate Dock — a bespoke Docker container for VPN-protected ebook and media downloads. Searches Anna's Archive and torrent indexers behind NordVPN. Auto-downloads via torrent when possible, sends manual download links when automation can't bypass CAPTCHAs.
 category: media
 ---
 
 # Pirate Dock Skill
 
 ## Overview
-A custom-built Docker container running NordVPN (South Africa, P2P), aria2 for downloads, and Jackett for multi-site torrent search. Two primary workflows: downloading eBooks from Anna's Archive, and searching/downloading torrents (UFC focus).
+A custom-built Docker container running NordVPN (South Africa, P2P), aria2 for downloads, and Jackett for multi-site torrent search. Two parallel pipelines: Anna's Archive for ebooks, Jackett for torrents/video.
 
-**Architecture:** NO browser. NO Playwright. Just HTTP APIs + aria2.
+**Architecture:** NO browser. NO Playwright. Just HTTP APIs + aria2 + VPN tunnel. All search happens behind NordVPN; if automation can't complete a download, send the user the direct link to click manually.
 **Project home:** `~/Documents/GitHub/pirate-dock/`
 **Container name:** `pirate-dock`
 **API:** `http://localhost:9876`
@@ -100,34 +100,69 @@ bash scripts/prune-docker.sh --aggressive  # Nuclear option
 
 ---
 
-## Workflow: eBook from Anna's Archive
+## Core Workflow: Book Request (2026-04-14)
 
-1. User provides book name, ISBN, or MD5 hash
-2. If name: `GET /search/annas-archive?q=Book+Name`
-3. Returns list with MD5 hashes, titles, sources
-4. Pick result: `GET /download/annas-archive/{md5}`
-5. Returns page URL, title, and any direct download links
-6. Files land in `/downloads` → copy to `araminta-vault/library/`
+When a user asks for a book (by title, Amazon link, Goodreads link, ISBN, or MD5), follow this sequence:
 
-**Download reality check (as of 2026-04-14):**
-- **Search always works** — scraping Anna's Archive search results page is reliable
-- **Slow downloads blocked** — Anna's Archive uses DDoS-Guard browser challenge on download endpoints. Cannot bypass from within the container (no browser). Need either a browser-based bypass or the DDoS-Guard to be removed.
-- **Internet Archive (IA) downloads** — some books require borrow authorization (401). Openly available IA items download fine.
-- **Torrent via Anna's Archive** — torrents on aa are bulk archive torrents (200GB+), not individual books
-- **Best current path:** Jackett torrent search → magnet → aria2. Requires configured indexers.
+### Step 1: Identify the book
+- If given a URL (Amazon, Goodreads): resolve it to get the ISBN/title
+- If given a title: use it directly
+
+### Step 2: Search both pipelines in parallel (behind NordVPN)
+```
+Anna's Archive:  GET /search/annas-archive?q=<title+author+isbn>
+Torrent:         GET /search/torrents?q=<title+author+isbn>
+```
+
+### Step 3: Evaluate results
+
+**A) Torrent found with seeders ≥ 2 → AUTO-DOWNLOAD**
+```
+POST /download/magnet {"magnet": "<best_magnet_link>"}
+```
+Report: title, size, seeders. The file will land in `/downloads` inside the container.
+
+**B) No torrent with seeders → SEND ANNA'S ARCHIVE LINK**
+- Report what was found: title, MD5, file size, available formats (EPUB/PDF/MOBI)
+- Provide the Anna's Archive page link: `https://annas-archive.gl/md5/{md5}`
+- List the mirror links (`.gl`, `.pk`, `.gd`)
+- User clicks the link and completes the download manually (one-click behind the VPN)
+
+**C) Nothing found on either pipeline → report that clearly**
+
+### Step 4: Report results
+
+Always provide:
+1. **What the book is** (title, author, format, size)
+2. **Auto-download status** (downloaded / link to click)
+3. **Anna's Archive link** (always include, as fallback)
+4. **Torrent details** (if applicable: seeders, source indexer)
+
+---
+
+## Download Reality (as of 2026-04-14)
+
+**What works automatically:**
+- ✅ Anna's Archive **search** — reliable scraping of search results
+- ✅ Jackett **torrent search** — TPB, 1337x, LimeTorrents, YTS, EZTV configured
+- ✅ **aria2 downloads** via magnet — fast when seeders are healthy
+
+**What doesn't work automatically:**
+- ❌ Anna's Archive **slow/fast downloads** — DDoS-Guard browser challenge blocks all automated access. Requires manual browser interaction with a proprietary CAPTCHA. No third-party service (Browserbase, Camoufox, Steel) can bypass it reliably.
+
+**Why no browser automation:** The container is deliberately lightweight (~400MB) and VPN-tunnelled. Outsourcing downloads to third-party browser services (Browserbase, Steel) would route traffic outside the VPN, defeating the privacy model. The architecture is: **container searches, container downloads if possible, user downloads manually if not.**
+
+---
 
 ## Workflow: Torrent Search (Jackett)
 
 1. Jackett runs inside the container with 619 indexer definitions loaded
-2. **FIRST RUN: configure indexers via web UI at `http://localhost:9118`**
-   - Must be done from a browser (not via API)
-   - Public indexers (The Pirate Bay, 1337x, etc.) need to be explicitly enabled
-   - Private indexers need account credentials
+2. **Configured indexers:** The Pirate Bay, 1337x, LimeTorrents, YTS, EZTV, 1337x (public, no account needed)
 3. Search: `GET /search/torrents?q=UFC+327`
 4. Returns results with title, size, seeders, magnet link
 5. Download: `POST /download/magnet {"magnet": "magnet:..."}`
 
-**Jackett setup priority:** Enable The Pirate Bay and 1337x as a minimum. These are public, no account needed. Access the Jackett web UI via `http://localhost:9118` from a machine that can reach the Pi.
+**To add more indexers:** access Jackett web UI at `http://localhost:9118` from a machine that can reach the Pi.
 
 ## Workflow: UFC Event Watch
 
@@ -146,31 +181,21 @@ bash scripts/prune-docker.sh --aggressive  # Nuclear option
 - **Jackett API key:** Auto-detected on startup from `/data/jackett/ServerConfig.json`
 - **Jackett config:** Via web UI at `http://localhost:9118` (inside container)
 - **NordVPN default region:** South Africa (NordLynx P2P)
+- **Anna's Archive secret key:** In memory — free account, used for authenticated browsing (metadata only, downloads still CAPTCHA-gated)
 
 ---
 
-## Known Issue — RESOLVED (2026-04-14)
+## Known Issue — RESOLVED
 
-**VPN login bug: FIXED.** The s6-overlay init system in the bubuntux/nordvpn image strips Docker environment variables from CMD services. `nordvpn login --token` was receiving an empty token.
-**Fix:** Token is now read from a bind-mounted file (`/run/pirate-dock/token`) instead of environment variables. The `docker-compose.yml` maps `./scripts/token.txt` to `/run/pirate-dock/token` (read-only). A fallback to env vars is included for resilience.
+**VPN login bug: FIXED (2026-04-14).** Token read from bind-mounted file (`/run/pirate-dock/token`) instead of env vars (s6-overlay strips env vars).
 
-**How it works now:**
-1. `scripts/token.txt` contains the NordVPN token (loaded from `.env` at build time)
-2. `scripts/run.sh` reads the token from the bind-mounted file
-3. The s6 init system starts the NordVPN daemon (nordvpnd) and firewall as normal
-4. `run.sh` does `nordvpn login --token` with the file-sourced token, then connects
-5. Jackett starts alongside, and the FastAPI server serves on 9876
+**Jackett indexers: CONFIGURED (2026-04-14).** TPB, 1337x, LimeTorrents, YTS, EZTV all enabled and returning results.
 
-**Config:**
-- `docker-compose.yml` uses `command: ["/bin/bash", "/app/scripts/run.sh"]` (not `entrypoint` — preserves s6 `/init`)
-- Token file: `./scripts/token.txt` (64 chars, loaded from `.env` via `grep`)
-- To update token: edit `.env`, then `grep NORDVPN_TOKEN .env | cut -d= -f2 > scripts/token.txt`
+## Known Issue — CURRENT
 
-## Known Issue — CURRENT (2026-04-14)
+**Anna's Archive downloads: CAPTCHA-GATED (ongoing).** DDoS-Guard on `/slow_download/` and `/fast_download/` requires manual browser verification (proprietary CAPTCHA). Automated download not possible without violating the privacy architecture (third-party browser services outside VPN). Solution: provide the user with the direct Anna's Archive link for manual download.
 
-**Jackett returns 0 search results.** 619 indexer definitions are loaded, but no public indexers are enabled by default. Must configure indexers via Jackett web UI (`http://localhost:9118`) before torrent search works. Minimum setup: enable The Pirate Bay and 1337x (public, no account needed).
-
-**Anna's Archive downloads blocked by DDoS-Guard.** The download endpoints (`/slow_download/`, `/fast_download/`) use DDoS-Guard browser challenge. The container has no browser. The metadata/search page on the `.pk` mirror works fine; only the download endpoints are protected. Alternative: configure Jackett indexers for direct torrent download instead.
+---
 
 ## Notes
 
@@ -178,7 +203,6 @@ bash scripts/prune-docker.sh --aggressive  # Nuclear option
 - Jackett state persisted in `pirate-dock-data` Docker volume at `/data/jackett/`
 - Build scripts include disk space guardrails (refuses to build above 85% usage)
 - `.dockerignore` prevents build context bloat (no .git, downloads, docs inside image)
-- The old `pirate-container` (Node.js based) has been archived — do not use
 - Image is ~400MB (no Chromium!) vs old 2.77GB
 - VPN kill switch blocks non-VPN traffic — use `docker exec` for local API calls from the host
 - Token is 64 chars, stored in `.env` and `scripts/token.txt` — never commit `token.txt` to git (it's in `.gitignore`)

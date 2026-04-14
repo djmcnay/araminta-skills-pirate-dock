@@ -37,6 +37,7 @@ RUN ARCH="${TARGETARCH}" && \
 RUN mkdir -p /app /downloads /data
 WORKDIR /app
 COPY scripts/ /app/scripts/
+RUN chmod +x /app/scripts/*.sh
 
 # Copy server.py to app root so uvicorn can import it
 COPY scripts/server.py /app/server.py

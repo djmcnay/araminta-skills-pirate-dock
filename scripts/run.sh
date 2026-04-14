@@ -7,25 +7,29 @@ export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-/root/.config}"
 export XDG_DATA_HOME="${XDG_DATA_HOME:-/root/.local/share}"
 export JACKETT_PORT="${JACKETT_PORT:-9118}"
 
-# Token: try multiple sources (s6 strips env, so also try reading from envdir)
-_s6_envdir="/var/run/s6/container_environment"
-if [ -f "${_s6_envdir}/TOKEN" ]; then
-    NORDVPN_TOKEN="$(cat "${_s6_envdir}/TOKEN")"
-elif [ -f "${_s6_envdir}/NORDVPN_TOKEN" ]; then
-    NORDVPN_TOKEN="$(cat "${_s6_envdir}/NORDVPN_TOKEN")"
+# Read token from bind-mounted file (avoids s6 env var stripping)
+TOKEN_FILE="/run/pirate-dock/token"
+if [ -f "$TOKEN_FILE" ]; then
+    NORDVPN_TOKEN="$(cat "$TOKEN_FILE" | tr -d '[:space:]')"
+    echo "[vpn] Token loaded from file (${#NORDVPN_TOKEN} chars)."
 else
+    # Fallback to env var (in case s6 passes it through)
     NORDVPN_TOKEN="${NORDVPN_TOKEN:-${TOKEN:-}}"
+    if [ -n "${NORDVPN_TOKEN:-}" ]; then
+        echo "[vpn] Token loaded from env var."
+    else
+        echo "[vpn] WARNING: No token found!"
+    fi
 fi
 
 JACKETT_BIN="/opt/jackett/jackett"
 JACKETT_DATA="/data/jackett"
 
 echo "━━━ Pirate Dock v2 ━━━"
-echo "API:  http://0.0.0.0:9876"
-echo "Jackett: http://0.0.0.0:${JACKETT_PORT}"
-echo "Token: $([ -n "${NORDVPN_TOKEN:-}" ] && echo "SET (${#NORDVPN_TOKEN} chars)" || echo "MISSING")"
+echo "API:      http://0.0.0.0:9876"
+echo "Jackett:  http://0.0.0.0:${JACKETT_PORT}"
 
-# ── Wait for NordVPN daemon (started by s6) ───────────────────
+# ── Wait for NordVPN daemon (started by s6 /init) ─────────────
 echo "[vpn] Waiting for NordVPN daemon..."
 for i in $(seq 1 30); do
     if nordvpn status 2>&1 | grep -q "Status:"; then
@@ -40,7 +44,7 @@ done
 nordvpn set analytics disabled 2>&1 || true
 nordvpn set meshnet off 2>&1 || true
 
-# ── Login (foreground, persists auth state) ───────────────────
+# ── Login (foreground — auth state persists to daemon) ────────
 if [ -n "${NORDVPN_TOKEN:-}" ]; then
     echo "[vpn] Authenticating..."
     if nordvpn login --token "$NORDVPN_TOKEN" 2>&1; then
@@ -48,20 +52,18 @@ if [ -n "${NORDVPN_TOKEN:-}" ]; then
     else
         echo "[vpn] Login FAILED."
     fi
-else
-    echo "[vpn] WARNING: No token available"
 fi
 
-# ── Connect (background) ─────────────────────────────────────
+# ── Connect (background — don't block Jackett/API) ────────────
 (
     COUNTRY="${NORDVPN_COUNTRY:-South_Africa}"
     GROUP="${NORDVPN_GROUP:-P2P}"
     TECH="${NORDVPN_TECHNOLOGY:-NordLynx}"
 
+    sleep 2
     nordvpn set technology "$TECH" 2>&1 || true
     sleep 1
     echo "[vpn] Connecting to $COUNTRY ($GROUP)..."
-    sleep 1
 
     nordvpn connect --group "$GROUP" "$COUNTRY" 2>&1 || \
     nordvpn connect --group "$GROUP" 2>&1 || \

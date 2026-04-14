@@ -9,16 +9,16 @@ services:
     devices:
       - /dev/net/tun
     environment:
-      - NORDVPN_TOKEN=${NORDVPN_TOKEN}
-      - NORDVPN_LOGIN_TOKEN=${NORDVPN_LOGIN_TOKEN}
-      - NORDVPN_COUNTRY=South_Africa
-      - NORDVPN_TECHNOLOGY=NordLynx
-      - NORDVPN_GROUP=P2P
+      - CONNECT=South_Africa
+      - TECHNOLOGY=NordLynx
       - HOME=/root
       - XDG_CONFIG_HOME=/root/.config
+      - XDG_DATA_HOME=/root/.local/share
       - JACKETT_PORT=9118
+    command: ["/bin/bash", "/app/scripts/run.sh"]
     volumes:
       - ./downloads:/downloads
+      - ./scripts/token.txt:/run/pirate-dock/token:ro
       - pirate-dock-data:/data
     ports:
       - "9876:9876"

@@ -1,1 +1,6 @@
 scripts/__pycache__/
+scripts/token.txt
+.env
+*.aria2
+downloads/
+tmp/

@@ -99,10 +99,19 @@ def vpn_check():
 _jackett_proc = None
 
 def _start_jackett():
-    """Start Jackett as background process."""
+    """Start Jackett as background process (skip if already running)."""
     global _jackett_proc
+
+    # Check if Jackett is already running (e.g. from previous container boot)
+    try:
+        r = httpx.get(f"http://127.0.0.1:{JACKETT_PORT}/api/v2.0/indexers", timeout=2)
+        if r.status_code in (200, 302):
+            return True  # Already running, no need to start
+    except Exception:
+        pass
+
     if _jackett_proc and _jackett_proc.poll() is None:
-        return  # already running
+        return  # Already started by us
 
     jackett_dir = DATA_DIR / "jackett"
     jackett_dir.mkdir(parents=True, exist_ok=True)
@@ -119,7 +128,7 @@ def _start_jackett():
     for i in range(30):
         try:
             r = httpx.get(f"http://127.0.0.1:{JACKETT_PORT}/api/v2.0/indexers", timeout=2)
-            if r.status_code == 200:
+            if r.status_code in (200, 302):
                 return True
         except Exception:
             pass
@@ -197,7 +206,7 @@ async def search_annas_post(req: AnnaSearchRequest):
 async def _search_annas(query: str, mirror: str | None = None):
     """Scrape Anna's Archive search results page."""
     mirrors = [mirror] if mirror else ANNAS_MIRRORS
-    search_url_template = "{}/s?q={}"
+    search_url_template = "{}/search?q={}"
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
@@ -231,44 +240,70 @@ async def _search_annas(query: str, mirror: str | None = None):
     }
 
 def _parse_annas_search(html: str, base_url: str) -> list:
-    """Parse Anna's Archive search results HTML."""
+    """Parse Anna's Archive search results HTML (updated 2026-04-14 for new UI)."""
     from bs4 import BeautifulSoup
+    import re
 
     soup = BeautifulSoup(html, "lxml")
     results = []
 
-    # Anna's Archive search results are in divs with class 'js-search-result'
-    for row in soup.select('.js-search-result, .search-result'):
+    # New structure (2026-04): div.js-aarecord-list-outer is the main container
+    # Each result row is a child div with flex/border-b classes
+    container = soup.select_one(".js-aarecord-list-outer")
+    if container:
+        rows = [c for c in container.children
+                if hasattr(c, 'get') and 'border-b' in ' '.join(c.get('class', []))]
+    else:
+        # Fallback to old class names
+        rows = soup.select('.js-search-result, .search-result')
+
+    for row in rows:
         try:
-            # Extract MD5 from the link
-            link = row.select_one('a[href*="/md5/"], a[href*="/isbn/"], a[href*="/doi/"]')
+            link = row.select_one("a[href*='/md5/'], a[href*='/isbn/'], a[href*='/doi/']")
             if not link:
                 continue
 
             href = link.get("href", "")
-            # Extract MD5 hash from URL
             md5 = ""
             for part in href.split("/"):
                 if len(part) == 32 and all(c in "0123456789abcdef" for c in part):
                     md5 = part
                     break
 
-            # Title
-            title_el = row.select_one('.search-result-title, h3, .search-result-md5')
-            title = title_el.get_text(strip=True) if title_el else "Unknown"
+            # Title and details from info div
+            info_div = row.select_one("div.max-w-full, div.overflow-hidden")
+            title = "Unknown"
+            size = ""
+            details = ""
 
-            # Size, format, source
-            size_el = row.select_one('.search-result-size')
-            size = size_el.get_text(strip=True) if size_el else ""
+            if info_div:
+                texts = []
+                for child in info_div.descendants:
+                    if hasattr(child, 'name') and child.name in ('div', 'span', 'a', 'p', 'h3'):
+                        t = child.get_text(strip=True)
+                        if t and t not in texts:
+                            texts.append(t)
 
-            details_el = row.select_one('.search-result-right')
-            details = details_el.get_text(strip=True) if details_el else ""
+                full_text = info_div.get_text(separator=" ", strip=True)
 
-            # Source library (Z-Library, LibGen, etc.)
-            source_el = row.select_one('.search-result-source, .search-result-icon img')
+                # Title: second meaningful text chunk (first is often filename)
+                if len(texts) >= 2:
+                    title = texts[1]
+                elif texts:
+                    title = texts[0]
+
+                # Size
+                size_match = re.search(r'(\d+[\.,]?\d*)\s*(MB|KB|GB)', full_text)
+                if size_match:
+                    size = size_match.group(0)
+
+                details = full_text[:120]
+
+            # Source library
             source = ""
-            if source_el:
-                source = source_el.get("title", "") or source_el.get("alt", "") or source_el.get_text(strip=True)
+            source_img = row.select_one("img[alt]")
+            if source_img:
+                source = source_img.get("alt", "")
 
             if md5:
                 results.append({
@@ -284,10 +319,7 @@ def _parse_annas_search(html: str, base_url: str) -> list:
 
     # Fallback: regex for MD5 hashes if structured parsing found nothing
     if not results:
-        import re
         md5_pattern = re.compile(r'/md5/([a-f0-9]{32})')
-        titles = re.compile(r'<div[^>]*class="[^"]*search-result[^"]*"[^>]*>.*?</div>', re.DOTALL)
-
         seen = set()
         for match in md5_pattern.finditer(html):
             md5 = match.group(1)

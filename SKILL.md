@@ -49,6 +49,17 @@ bash scripts/prune-docker.sh            # Standard cleanup
 bash scripts/prune-docker.sh --aggressive  # Nuclear option
 ```
 
+### Skill Tests
+```bash
+# Run full test suite inside the container
+docker exec pirate-dock python3 /app/scripts/test.py
+```
+
+Tests three things:
+1. Anna's Archive search — finds a book and generates download links
+2. Jackett torrent search — lists top 10 UFC video results
+3. Download lifecycle — starts a torrent download, cancels it, deletes partial files
+
 ---
 
 ## API Reference (`http://localhost:9876`)
@@ -80,7 +91,7 @@ bash scripts/prune-docker.sh --aggressive  # Nuclear option
 | GET | `/search/piratebay?q=...` | — | Search PirateBay only |
 | GET | `/search/1337x?q=...` | — | Search 1337x only |
 | GET | `/search/ext?q=...` | — | Search ext.to only |
-| GET | `/jackett/indexers` | — | List available Jackett indexers |
+| GET | `/jackett/indexers` | — | List available indexers |
 
 ### Downloads
 
@@ -100,7 +111,7 @@ bash scripts/prune-docker.sh --aggressive  # Nuclear option
 
 ---
 
-## Core Workflow: Book Request (2026-04-14)
+## Core Workflow: Book Request
 
 When a user asks for a book (by title, Amazon link, Goodreads link, ISBN, or MD5), follow this sequence:
 
@@ -126,7 +137,7 @@ Report: title, size, seeders. The file will land in `/downloads` inside the cont
 - Report what was found: title, MD5, file size, available formats (EPUB/PDF/MOBI)
 - Provide the Anna's Archive page link: `https://annas-archive.gl/md5/{md5}`
 - List the mirror links (`.gl`, `.pk`, `.gd`)
-- User clicks the link and completes the download manually (one-click behind the VPN)
+- User clicks the link and completes the download manually
 
 **C) Nothing found on either pipeline → report that clearly**
 
@@ -140,7 +151,7 @@ Always provide:
 
 ---
 
-## Download Reality (as of 2026-04-14)
+## Download Reality
 
 **What works automatically:**
 - ✅ Anna's Archive **search** — reliable scraping of search results
@@ -152,12 +163,14 @@ Always provide:
 
 **Why no browser automation:** The container is deliberately lightweight (~400MB) and VPN-tunnelled. Outsourcing downloads to third-party browser services (Browserbase, Steel) would route traffic outside the VPN, defeating the privacy model. The architecture is: **container searches, container downloads if possible, user downloads manually if not.**
 
+**Seeder count caveat:** Torznab seeder counts (especially from TPB) may show 0 even when torrents are alive and downloadable. Always try downloading before reporting "no seeders" to the user.
+
 ---
 
 ## Workflow: Torrent Search (Jackett)
 
 1. Jackett runs inside the container with 619 indexer definitions loaded
-2. **Configured indexers:** The Pirate Bay, 1337x, LimeTorrents, YTS, EZTV, 1337x (public, no account needed)
+2. **Configured public indexers:** The Pirate Bay, 1337x, LimeTorrents, YTS, EZTV
 3. Search: `GET /search/torrents?q=UFC+327`
 4. Returns results with title, size, seeders, magnet link
 5. Download: `POST /download/magnet {"magnet": "magnet:..."}`
@@ -185,24 +198,28 @@ Always provide:
 
 ---
 
-## Known Issue — RESOLVED
+## Known Issues — RESOLVED
 
-**VPN login bug: FIXED (2026-04-14).** Token read from bind-mounted file (`/run/pirate-dock/token`) instead of env vars (s6-overlay strips env vars).
+- **VPN login bug (2026-04-14).** Token read from bind-mounted file (`/run/pirate-dock/token`) instead of env vars (s6-overlay strips env vars).
+- **Jackett indexers (2026-04-14).** TPB, 1337x, LimeTorrents, YTS, EZTV all enabled and returning results.
+- **Anna's Archive search URL (2026-04-14).** AA changed `/s?q=` to `/search?q=`. Fixed in `server.py`.
+- **Anna's Archive HTML parser (2026-04-14).** New UI uses `.js-aarecord-list-outer` container with flex/border-b child divs. Updated `_parse_annas_search()`.
+- **Jackett startup deadlock (2026-04-14).** `_start_jackett()` now checks for already-running Jackett before starting a new process; accepts HTTP 302 in addition to 200 (Jackett returns 302 for the indexers endpoint).
 
-**Jackett indexers: CONFIGURED (2026-04-14).** TPB, 1337x, LimeTorrents, YTS, EZTV all enabled and returning results.
+## Known Issues — CURRENT
 
-## Known Issue — CURRENT
-
-**Anna's Archive downloads: CAPTCHA-GATED (ongoing).** DDoS-Guard on `/slow_download/` and `/fast_download/` requires manual browser verification (proprietary CAPTCHA). Automated download not possible without violating the privacy architecture (third-party browser services outside VPN). Solution: provide the user with the direct Anna's Archive link for manual download.
+- **Anna's Archive downloads: CAPTCHA-GATED.** DDoS-Guard on `/slow_download/` and `/fast_download/` requires manual browser verification. Solution: provide the user with the direct Anna's Archive link for manual download.
+- **Anna's Archive title extraction:** The parser extracts MD5 hashes correctly but titles show as "Unknown" — the title lives in a complex nested DOM structure that needs further parsing work.
+- **Jackett seeder counts via Torznab:** Consistently report 0 seeders even when torrents are alive. TPB's Torznab adapter doesn't report accurate seeder data.
 
 ---
 
 ## Notes
 
-- Downloads land in `/downloads` inside the container, mapped to `./downloads` on the host
+- Downloads land in `/downloads` inside the container, mapped to `./downloads` on the host (bind mount)
 - Jackett state persisted in `pirate-dock-data` Docker volume at `/data/jackett/`
 - Build scripts include disk space guardrails (refuses to build above 85% usage)
 - `.dockerignore` prevents build context bloat (no .git, downloads, docs inside image)
 - Image is ~400MB (no Chromium!) vs old 2.77GB
 - VPN kill switch blocks non-VPN traffic — use `docker exec` for local API calls from the host
-- Token is 64 chars, stored in `.env` and `scripts/token.txt` — never commit `token.txt` to git (it's in `.gitignore`)
+- Token is 64 chars, stored in `.env` and `scripts/token.txt` — never commit `token.txt` to git

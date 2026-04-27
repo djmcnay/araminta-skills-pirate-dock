@@ -43,7 +43,7 @@ echo "[vnc] Starting Xvfb + x11vnc + noVNC..."
 export DISPLAY=:1
 Xvfb :1 -screen 0 1280x800x24 -ac +extension GLX +render -noreset &
 sleep 1
-openbox --display :1 &
+openbox &
 sleep 1
 x11vnc -display :1 -rfbport 5901 -nopw -forever -localhost -quiet &
 sleep 1

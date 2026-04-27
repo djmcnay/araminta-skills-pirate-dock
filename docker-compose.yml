@@ -2,12 +2,19 @@ services:
   pirate-dock:
     build: .
     container_name: pirate-dock
-    restart: unless-stopped
+    restart: "no"              # On-demand only — never auto-restart unexpectedly
+    # IMPORTANT: Do NOT use network_mode: host.
     cap_add:
-      - NET_ADMIN
-      - SYS_MODULE
+      - NET_ADMIN              # Required for NordVPN/WireGuard tunnel inside container
+      - SYS_MODULE             # Required for WireGuard kernel module
     devices:
       - /dev/net/tun
+    ports:
+      - "127.0.0.1:9876:9876" # API — localhost only
+      - "127.0.0.1:9118:9118" # Jackett UI — localhost only
+      - "5998:5998"           # noVNC — all interfaces so Tailscale can reach it
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - CONNECT=South_Africa
       - TECHNOLOGY=NordLynx
@@ -15,14 +22,14 @@ services:
       - XDG_CONFIG_HOME=/root/.config
       - XDG_DATA_HOME=/root/.local/share
       - JACKETT_PORT=9118
+      - DISPLAY=:1
+      - NOVNC_URL=http://100.65.212.67:5998/vnc.html
     command: ["/bin/bash", "/app/scripts/run.sh"]
     volumes:
       - ./downloads:/downloads
       - ./scripts/token.txt:/run/pirate-dock/token:ro
+      - ./.env:/app/.env:ro
       - pirate-dock-data:/data
-    ports:
-      - "9876:9876"
-      - "9118:9118"
     dns:
       - 1.1.1.1
       - 8.8.8.8

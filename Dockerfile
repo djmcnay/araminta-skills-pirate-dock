@@ -7,17 +7,34 @@ ENV HOME=/root \
     DEBIAN_FRONTEND=noninteractive \
     XDG_CONFIG_HOME=/root/.config \
     XDG_DATA_HOME=/root/.local/share \
-    JACKETT_PORT=9118
+    JACKETT_PORT=9118 \
+    DISPLAY=:1
 
-# ── System deps (minimal — no browser libs!) ─────────────────
+# ── System deps ───────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates iptables iproute2 procps \
     aria2 jq python3 python3-pip python3-venv \
+    libnss3 libnspr4 libglib2.0-0 libatk1.0-0 libatk-bridge2.0-0 \
+    libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
+    libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 \
+    libatspi2.0-0 libx11-6 libxext6 libxfixes3 libxrender1 \
+    xvfb dbus-x11 xfonts-base x11-utils x11vnc \
+    openbox \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Python deps ──────────────────────────────────────────────
+# ── noVNC HTML5 client (tarball has vnc.html; pip package does not) ──
+RUN curl -L -o /tmp/novnc.tar.gz \
+        https://github.com/novnc/noVNC/archive/v1.3.0.tar.gz \
+    && tar xzf /tmp/novnc.tar.gz -C /tmp \
+    && mv /tmp/noVNC-1.3.0 /opt/novnc \
+    && rm /tmp/novnc.tar.gz
+
+# ── Python deps + Playwright Chromium + Camoufox Firefox ─────
 COPY scripts/requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt \
+    && playwright install chromium \
+    && playwright install-deps chromium \
+    && python -m camoufox install
 
 # ── Jackett (multi-arch aware) ───────────────────────────────
 ARG TARGETARCH
@@ -38,12 +55,11 @@ RUN mkdir -p /app /downloads /data
 WORKDIR /app
 COPY scripts/ /app/scripts/
 RUN chmod +x /app/scripts/*.sh
-
-# Copy server.py to app root so uvicorn can import it
 COPY scripts/server.py /app/server.py
+COPY scripts/browser_fallback.py /app/browser_fallback.py
 
 # ── Volumes & ports ──────────────────────────────────────────
 VOLUME /downloads /data
-EXPOSE 9876
+EXPOSE 9876 9118 5998
 
-CMD ["/app/scripts/entrypoint.sh"]
+CMD ["/app/scripts/run.sh"]

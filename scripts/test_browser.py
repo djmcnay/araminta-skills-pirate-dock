@@ -203,7 +203,7 @@ class TestBrowserStatus(unittest.TestCase):
 
         import browser_fallback
 
-        self.assertEqual(browser_fallback.DISPLAY_URL, "https://araminta.taild3f7b9.ts.net:8443/pirate/")
+        self.assertEqual(browser_fallback.DISPLAY_URL, "https://araminta.taild3f7b9.ts.net/pirate/")
 
     def test_display_url_env_override(self):
         os.environ["DISPLAY_URL"] = "https://custom.example/"

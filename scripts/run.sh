@@ -47,7 +47,7 @@ xpra shadow :1 \
     --tcp-auth=none \
     --html=on \
     --no-daemon &
-DISPLAY_URL="${DISPLAY_URL:-https://araminta.taild3f7b9.ts.net:8443/pirate/}"
+DISPLAY_URL="${DISPLAY_URL:-https://araminta.taild3f7b9.ts.net/pirate/}"
 echo "[display] xpra HTML5 ready: $DISPLAY_URL"
 
 echo "━━━ Pirate Dock v3 ━━━"

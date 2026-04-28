@@ -6,8 +6,7 @@ A bespoke Docker container for privacy-first downloads — ebooks from Anna's Ar
 
 Pirate Dock keeps browser automation and all download/search traffic inside the
 container's NordVPN network namespace. The host Pi does not join the VPN. When
-Minty needs human help, she shows the container browser through Xpra over
-Tailscale.
+Minty needs human help, she sends the public HTTPS browser URL that opens Xpra.
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -23,15 +22,15 @@ Tailscale.
 │  Xpra HTML5 display on :6081                │
 └─────────────────────────────────────────────┘
 
-Tailnet URL for human-in-the-loop browser access:
-https://araminta.taild3f7b9.ts.net:8443/pirate/
+Browser URL for human-in-the-loop browser access:
+https://araminta.taild3f7b9.ts.net/pirate/
 ```
 
 **Key design decisions:**
 - All traffic through **NordVPN South Africa** (NordLynx P2P) via a strict kill switch
 - Browser fallback runs **inside the container**, never on the host
-- Tailscale Serve exposes the Xpra display to the Tailnet only:
-  `https://araminta.taild3f7b9.ts.net:8443/pirate/` → `http://127.0.0.1:6081`
+- Tailscale Funnel exposes the Xpra display over public HTTPS:
+  `https://araminta.taild3f7b9.ts.net/pirate/` → `http://127.0.0.1:6081`
 - Minty can send that URL by WhatsApp when CAPTCHA, login, or visual confirmation blocks automation
 - Torrents: full pipeline search → magnet → aria2 download behind VPN
 
@@ -46,15 +45,15 @@ bash scripts/build.sh          # Safe build with disk check
 The container exposes:
 - **FastAPI API:** `http://localhost:9876`
 - **Jackett UI:** `http://localhost:9118`
-- **Human browser display:** `https://araminta.taild3f7b9.ts.net:8443/pirate/` (Tailnet only)
+- **Human browser display:** `https://araminta.taild3f7b9.ts.net/pirate/` (public HTTPS)
 
-Tailscale Serve must point at Xpra:
+Tailscale Funnel must point at Xpra:
 
 ```bash
-sudo tailscale serve --bg --https=8443 --set-path=/pirate 6081
-sudo tailscale serve status
+sudo tailscale funnel --bg --https=443 --set-path=/pirate 6081
+sudo tailscale funnel status
 # expected:
-# https://araminta.taild3f7b9.ts.net:8443 (tailnet only)
+# https://araminta.taild3f7b9.ts.net (Funnel on)
 # |-- /pirate proxy http://127.0.0.1:6081
 ```
 
@@ -81,7 +80,7 @@ sudo tailscale serve status
 
 **Note:** Anna's Archive search returns MD5 hashes and metadata. If DDoS-Guard
 or CAPTCHA blocks automation, Minty should send
-`https://araminta.taild3f7b9.ts.net:8443/pirate/` so the user can interact with the browser
+`https://araminta.taild3f7b9.ts.net/pirate/` so the user can interact with the browser
 running inside the VPN container.
 
 ### Torrent Search (via Jackett)

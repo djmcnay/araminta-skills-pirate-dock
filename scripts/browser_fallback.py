@@ -23,7 +23,7 @@ from pathlib import Path
 import warnings
 
 DOWNLOAD_DIR = Path("/downloads")
-DISPLAY_URL = os.environ.get("DISPLAY_URL", "https://araminta.taild3f7b9.ts.net:8443/pirate/")
+DISPLAY_URL = os.environ.get("DISPLAY_URL", "https://araminta.taild3f7b9.ts.net/pirate/")
 
 # Anna's Archive mirrors (tried in order; .li is DEAD — see skill notes)
 ANNAS_MIRRORS = [

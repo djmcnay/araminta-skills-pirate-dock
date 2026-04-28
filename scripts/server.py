@@ -197,7 +197,7 @@ async def get_status():
     )
     s["jackett_port"] = JACKETT_PORT
     s["jackett_api_key_set"] = bool(JACKETT_API_KEY)
-    s["display_url"] = os.getenv("DISPLAY_URL", "https://araminta.taild3f7b9.ts.net:8443/pirate/")
+    s["display_url"] = os.getenv("DISPLAY_URL", "https://araminta.taild3f7b9.ts.net/pirate/")
     return s
 
 @app.post("/vpn/connect")

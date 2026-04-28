@@ -14,10 +14,10 @@ A custom-built Docker container running NordVPN (South Africa, P2P), aria2 for d
 **Container name:** `pirate-dock`
 **API:** `http://localhost:9876` (published port — no `docker exec` needed)
 **Jackett UI:** `http://localhost:9118` (published port)
-**Human browser display:** `https://araminta.taild3f7b9.ts.net:8443/pirate/` (Tailnet only via Tailscale Serve)
-**Browser fallback:** Container-local Playwright/Chromium — launched inside `pirate-dock`; zero host CDP/browser dependency. Headed Chromium uses container display `:1`, Xpra serves it on container/host port `6081`, and Tailscale Serve exposes it to the Tailnet.
+**Human browser display:** `https://araminta.taild3f7b9.ts.net/pirate/` (public HTTPS via Tailscale Funnel)
+**Browser fallback:** Container-local Playwright/Chromium — launched inside `pirate-dock`; zero host CDP/browser dependency. Headed Chromium uses container display `:1`, Xpra serves it on container/host port `6081`, and Tailscale Funnel exposes it at the public HTTPS browser URL.
 
-**Tailscale Serve invariant:** `https://araminta.taild3f7b9.ts.net:8443/pirate/` must proxy to `http://127.0.0.1:6081`. Check with `sudo tailscale serve status`. Repair with `sudo tailscale serve --bg --https=8443 --set-path=/pirate 6081`. Use Serve for Tailnet access; do not depend on public Funnel for this workflow, and do not overwrite unrelated root routes on `https://araminta.taild3f7b9.ts.net/`.
+**Tailscale Funnel invariant:** `https://araminta.taild3f7b9.ts.net/pirate/` must proxy to `http://127.0.0.1:6081`. Check with `sudo tailscale funnel status`. Repair with `sudo tailscale funnel --bg --https=443 --set-path=/pirate 6081`. Use Funnel for browser access, and do not overwrite unrelated root routes on `https://araminta.taild3f7b9.ts.net/`.
 
 ---
 
@@ -30,31 +30,31 @@ cd ~/Documents/GitHub/pirate-dock
 bash scripts/build.sh
 ```
 
-**After container start:** `run.sh` auto-whitelists the Docker bridge subnet (`172.16.0.0/12`) and published ports (9876, 9118, **6081**) inside NordVPN's killswitch. This is required for the host Pi and Tailscale Serve to reach the FastAPI/Jackett/Xpra endpoints while NordVPN is active. If you manually change ports or networking, the whitelist must match.
+**After container start:** `run.sh` auto-whitelists the Docker bridge subnet (`172.16.0.0/12`) and published ports (9876, 9118, **6081**) inside NordVPN's killswitch. This is required for the host Pi and Tailscale Funnel to reach the FastAPI/Jackett/Xpra endpoints while NordVPN is active. If you manually change ports or networking, the whitelist must match.
 
-### Tailscale display URL
+### Browser display URL
 This is the URL Minty should send by WhatsApp when human intervention is needed:
 
 ```bash
-https://araminta.taild3f7b9.ts.net:8443/pirate/
+https://araminta.taild3f7b9.ts.net/pirate/
 ```
 
-Expected Tailscale Serve config:
+Expected Tailscale Funnel config:
 
 ```bash
-sudo tailscale serve status
-# https://araminta.taild3f7b9.ts.net:8443 (tailnet only)
+sudo tailscale funnel status
+# https://araminta.taild3f7b9.ts.net (Funnel on)
 # |-- /pirate proxy http://127.0.0.1:6081
 ```
 
 If it points anywhere else, repair it:
 
 ```bash
-sudo tailscale serve --bg --https=8443 --set-path=/pirate 6081
+sudo tailscale funnel --bg --https=443 --set-path=/pirate 6081
 ```
 
 ### Xpra display (inside container)
-When automation hits a visual challenge, `browser_fallback.py` launches Chromium in headed mode on container display `:1`. `run.sh` starts `Xvfb :1` and `xpra shadow :1 --bind-tcp=0.0.0.0:6081 --html=on`, so the browser is visible through the Tailnet URL above.
+When automation hits a visual challenge, `browser_fallback.py` launches Chromium in headed mode on container display `:1`. `run.sh` starts `Xvfb :1` and `xpra shadow :1 --bind-tcp=0.0.0.0:6081 --html=on`, so the browser is visible through the Browser URL above.
 
 Do not move the browser to the host. The browser must stay inside the container so its network traffic stays inside NordVPN while the host Pi remains off the VPN.
 
@@ -210,7 +210,7 @@ Always provide:
 4. Use the working mirror `https://annas-archive.gl` (the `.li` mirror was redirecting to parking/spam)
 5. Match the browser fingerprint to South Africa: timezone `Africa/Johannesburg`, locale `en-GB`, user-agent `Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36`
 6. **BLOCKED HERE**: AA's Downloads page now shows Z-Library mirrors, but Z-Library itself is down (503). The old "Slow Partner Server" path is gone.
-7. **Human-in-the-loop fallback**. When automation fails, Chromium can launch in **headed mode** on display `:1`, visible through `https://araminta.taild3f7b9.ts.net:8443/pirate/`. A human can interact with the browser inside the VPN tunnel to solve CAPTCHAs or click download links manually. The script then captures the resulting download URL or file.
+7. **Human-in-the-loop fallback**. When automation fails, Chromium can launch in **headed mode** on display `:1`, visible through `https://araminta.taild3f7b9.ts.net/pirate/`. A human can interact with the browser inside the VPN tunnel to solve CAPTCHAs or click download links manually. The script then captures the resulting download URL or file.
 8. File downloads via `curl --insecure --location` to `/downloads` — only works if a valid download URL is found
 
 **What does NOT work automatically (known gap):**
@@ -265,7 +265,7 @@ Always provide:
 - Docker bridge + killswitch blocked host-to-container API (2026-04-26). RESOLVED. When NordVPN connects inside the container with killswitch enabled, Docker bridge traffic (from host `172.19.0.1`) was dropped. Fix: `run.sh` now auto-whitelists the Docker bridge subnet and published ports (9876, 9118, **6081**) via `nordvpn whitelist add subnet 172.16.0.0/12`, `nordvpn whitelist add port 9876`, `nordvpn whitelist add port 9118`, `nordvpn whitelist add port 6081`. Container must restart to apply. The host can now reach the FastAPI, Jackett, and Xpra endpoints while NordVPN is active.
 - Playwright runtime installation failure (2026-04-26). RESOLVED. `playwright install chromium` was failing inside the container due to missing shared libraries. Fix: Dockerfile now installs `libnss3`, `xvfb`, and other Chromium system deps at image build time. Chromium is baked into the image at `/root/.cache/ms-playwright/`.
 - Anna's Archive downloads CAPTCHA — old host-CDP approach (2026-04-16). OBSOLETE. Originally used host CDP on port 9222 with xpra. Replaced by container-local Playwright (see 2026-04-26). Host CDP dependency removed.
-- **Old VNC/noVNC approach (2026-04-27).** OBSOLETE. The current display stack is `Xvfb :1` plus `xpra shadow :1` inside the container, served on port `6081` and exposed to the Tailnet by Tailscale Serve. Do not reintroduce noVNC ports (`5998`/`5999`) or host display `:99` for this workflow.
+- **Old VNC/noVNC approach (2026-04-27).** OBSOLETE. The current display stack is `Xvfb :1` plus `xpra shadow :1` inside the container, served on port `6081` and exposed at the public HTTPS browser URL by Tailscale Funnel. Do not reintroduce noVNC ports (`5998`/`5999`) or host display `:99` for this workflow.
 
 ## Known Issues — CURRENT
 
@@ -275,15 +275,15 @@ Always provide:
 **SOP for Anna's Archive downloads (updated 2026-04-28):**
 1. Automation first — `browser_download()` navigates book page, identifies and clicks the best download candidate (not hardcoded "Slow Partner Server" — AA DOM changes; it scores all links by download-likeness keywords)
 2. If DDoS-Guard JS challenge: wait up to 30s for auto-redirect
-3. If DDoS-Guard visual puzzle, hCAPTCHA, login, or another manual block appears, the container takes a screenshot and returns `screenshot_b64` plus `display_url`. Minty/the calling agent may use its own vision capability outside the container, or send David the Tailnet display URL.
-4. Human-in-the-loop URL: `https://araminta.taild3f7b9.ts.net:8443/pirate/`
+3. If DDoS-Guard visual puzzle, hCAPTCHA, login, or another manual block appears, the container takes a screenshot and returns `screenshot_b64` plus `display_url`. Minty/the calling agent may use its own vision capability outside the container, or send David the Display URL.
+4. Human-in-the-loop URL: `https://araminta.taild3f7b9.ts.net/pirate/`
 5. After challenge resolves → countdown page detected → `_handle_countdown_and_extract()` polls up to 180s:
    - Scans all `<a>`, `<button data-clipboard-text>`, `<input>`, `<textarea>` for token URLs matching `wbsg8v.xyz` or `/d3/y/`
    - Falls back to page redirect detection (`page.url` itself becoming the token)
    - Extracts cookies, curls file to `/downloads` with proper headers
 6. Token URL pattern learned: `https://wbsg8v.xyz/d3/y/{unix_ts}/3000/g4/{category}/...`
 
-**URL for human-in-the-loop:** `https://araminta.taild3f7b9.ts.net:8443/pirate/`
+**URL for human-in-the-loop:** `https://araminta.taild3f7b9.ts.net/pirate/`
 
 ---
 
@@ -294,9 +294,9 @@ Always provide:
 
 1. **All VPN traffic originates from INSIDE the container.** Never install/run NordVPN on the host Pi.
 2. **Container is disposable:** `docker compose down && up` should restore everything.
-3. **Host-to-container ports:** API and Jackett stay localhost-only (`127.0.0.1:9876`, `127.0.0.1:9118`). Xpra display is published as host port `6081` because Tailscale Serve proxies it to the Tailnet URL.
+3. **Host-to-container ports:** API and Jackett stay localhost-only (`127.0.0.1:9876`, `127.0.0.1:9118`). Xpra display is published as host port `6081` because Tailscale Funnel proxies it to the Browser URL.
 4. **Auto-whitelist Docker bridge subnet** in NordVPN on startup so killswitch doesn't block host access.
-5. **If you need to interact with the browser from within the VPN tunnel, use the Tailnet Xpra URL** (`https://araminta.taild3f7b9.ts.net:8443/pirate/`) — never run a browser on the host and route through the container.
+5. **If you need to interact with the browser from within the VPN tunnel, use the Xpra URL** (`https://araminta.taild3f7b9.ts.net/pirate/`) — never run a browser on the host and route through the container.
 
 ---
 

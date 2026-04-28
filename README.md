@@ -2,30 +2,37 @@
 
 A bespoke Docker container for privacy-first downloads — ebooks from Anna's Archive and torrents via Jackett, all tunnelled through NordVPN.
 
-## Architecture (v2)
+## Architecture (v3)
 
-**No browser. No Playwright. No Chromium.** Just HTTP APIs, aria2, and a VPN tunnel.
+Pirate Dock keeps browser automation and all download/search traffic inside the
+container's NordVPN network namespace. The host Pi does not join the VPN. When
+Minty needs human help, she shows the container browser through Xpra over
+Tailscale.
 
 ```
 ┌─────────────────────────────────────────────┐
 │  pirate-dock container (NordVPN tunnel)     │
 │                                             │
 │  ┌─────────┐    ┌─────────┐    ┌─────────┐ │
-│  │ FastAPI  │───▶│ Jackett │    │  aria2  │ │
-│  │ :9876    │    │ :9118   │    │(download│ │
-│  └─────────┘    └─────────┘    └─────────┘ │
-│       │              │              │       │
-│       ▼              ▼              ▼       │
-│  Anna's Archive   50+ torrent    /downloads │
-│  (HTTP scrape)    indexers       (PDF/ePUB/ │
-│                   (Torznab)       video)    │
+│  │ FastAPI │───▶│ Jackett │    │ aria2   │ │
+│  │ :9876   │    │ :9118   │    │download │ │
+│  └────┬────┘    └─────────┘    └─────────┘ │
+│       │                                     │
+│       ▼                                     │
+│  Playwright/Chromium on Xvfb :1             │
+│  Xpra HTML5 display on :6081                │
 └─────────────────────────────────────────────┘
+
+Tailnet URL for human-in-the-loop browser access:
+https://araminta.taild3f7b9.ts.net:8443/pirate/
 ```
 
 **Key design decisions:**
 - All traffic through **NordVPN South Africa** (NordLynx P2P) via a strict kill switch
-- No external browser services (Browserbase, Steel, Camoufox) — keeps traffic inside the VPN
-- Anna's Archive: search works, downloads blocked by DDoS-Guard CAPTCHA (user clicks link manually)
+- Browser fallback runs **inside the container**, never on the host
+- Tailscale Serve exposes the Xpra display to the Tailnet only:
+  `https://araminta.taild3f7b9.ts.net:8443/pirate/` → `http://127.0.0.1:6081`
+- Minty can send that URL by WhatsApp when CAPTCHA, login, or visual confirmation blocks automation
 - Torrents: full pipeline search → magnet → aria2 download behind VPN
 
 ## Quick Start
@@ -37,12 +44,21 @@ bash scripts/build.sh          # Safe build with disk check
 ```
 
 The container exposes:
-- **FastAPI API:** `http://localhost:9876` (use `docker exec` inside container)
+- **FastAPI API:** `http://localhost:9876`
 - **Jackett UI:** `http://localhost:9118`
+- **Human browser display:** `https://araminta.taild3f7b9.ts.net:8443/pirate/` (Tailnet only)
+
+Tailscale Serve must point at Xpra:
+
+```bash
+sudo tailscale serve --bg --https=8443 --set-path=/pirate 6081
+sudo tailscale serve status
+# expected:
+# https://araminta.taild3f7b9.ts.net:8443 (tailnet only)
+# |-- /pirate proxy http://127.0.0.1:6081
+```
 
 ## API Reference (`http://localhost:9876`)
-
-*Note: Use `docker exec pirate-dock curl http://127.0.0.1:9876/...` if VPN kill switch blocks host access.*
 
 ### VPN
 
@@ -59,8 +75,14 @@ The container exposes:
 | GET/POST | `/search/annas-archive?q=...` | Search books by title/author/ISBN |
 | GET | `/download/annas-archive/{md5}` | Get download info by MD5 hash |
 | POST | `/download/annas-archive` | Download by MD5: `{"md5": "..."}` |
+| POST | `/download/annas-archive/browser` | Force container browser fallback: `{"md5": "..."}` |
+| GET | `/download/annas-archive/{md5}/browser` | Force container browser fallback |
+| GET | `/browser/status` | Check Playwright and the display URL |
 
-**Note:** Anna's Archive search returns MD5 hashes and metadata. Slow/fast downloads are blocked by DDoS-Guard CAPTCHA — provide the user the page link to click manually.
+**Note:** Anna's Archive search returns MD5 hashes and metadata. If DDoS-Guard
+or CAPTCHA blocks automation, Minty should send
+`https://araminta.taild3f7b9.ts.net:8443/pirate/` so the user can interact with the browser
+running inside the VPN container.
 
 ### Torrent Search (via Jackett)
 
@@ -111,12 +133,10 @@ The container exposes:
 The `scripts/test.py` file provides a test suite that validates all major functionality:
 
 ```bash
-# Run inside the container
-docker exec pirate-dock python3 /app/scripts/test.py
-
-# Or from the host
 cd ~/Documents/GitHub/pirate-dock
 python3 scripts/test.py
+python3 scripts/test_browser.py
+python3 scripts/test_isolation.py
 ```
 
 **Tests:**
@@ -127,8 +147,8 @@ python3 scripts/test.py
 ## Files
 
 ```
-├── Dockerfile              # Based on bubuntux/nordvpn (~400MB)
-├── docker-compose.yml      # VPN + Jackett + API ports
+├── Dockerfile              # NordVPN base plus Playwright/Chromium/Xpra
+├── docker-compose.yml      # VPN + Jackett + API + Xpra ports
 ├── .dockerignore           # Prevents build context bloat
 ├── .env                    # NORDVPN_TOKEN (gitignored)
 ├── README.md               # This file
@@ -175,7 +195,7 @@ docker logs pirate-dock --tail 50
 
 - Downloads land in `/downloads` inside the container, mapped to `./downloads` on the host
 - Jackett state persisted in `pirate-dock-data` Docker volume at `/data/jackett/`
-- Image is ~400MB (no Chromium!) vs old 2.77GB
-- VPN kill switch blocks non-VPN traffic — use `docker exec` for local API calls from the host
+- Image includes Chromium/Xpra for human-in-the-loop browser fallback
+- VPN kill switch applies inside the container; host access works through whitelisted published ports
 - Token stored in `.env` and `scripts/token.txt` — **never commit `token.txt`** (in `.gitignore`)
 - Seeder counts reported via Torznab may show 0 even when torrents are alive — try downloading to verify

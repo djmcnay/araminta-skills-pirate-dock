@@ -5,7 +5,15 @@ A bespoke Docker container for two workflows:
 1. **eBook downloading** — Anna's Archive (search by title/ISBN, download by MD5)
 2. **UFC torrents** — Jackett-powered multi-site search, aria2 download behind VPN
 
-## Architecture v2 (2026-04-13)
+## Architecture v3 (current)
+
+Browser fallback is back because human-in-the-loop visual access is a core
+requirement for Minty. Playwright/Chromium runs inside `pirate-dock`, Xvfb/Xpra
+serves the headed browser on port `6081`, and Tailscale Serve exposes it at
+`https://araminta.taild3f7b9.ts.net:8443/pirate/` for laptop/phone access on the Tailnet.
+The host Pi remains outside the VPN.
+
+## Architecture v2 (2026-04-13, superseded)
 
 **Key change: NO browser.** Removed Playwright/Chromium entirely. Image went from 2.77GB to ~400MB.
 

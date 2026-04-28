@@ -1,7 +1,8 @@
 """
 Pirate Dock — API Server
 
-Architecture v2: NO browser. NO Playwright. NO Chromium.
+Architecture v3: headless first, with Playwright/Chromium browser fallback
+inside the container for human-in-the-loop visual flows.
 
 Phase 1: Anna's Archive — direct MD5-based downloads via mirrors
 Phase 2: Torrent search via Jackett (Torznab API) + aria2
@@ -21,6 +22,13 @@ from urllib.parse import quote
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import httpx
+
+# Browser fallback — Playwright inside the container
+try:
+    from browser_fallback import browser_download
+    HAS_BROWSER_FALLBACK = True
+except ImportError:
+    HAS_BROWSER_FALLBACK = False
 
 # ── Config ───────────────────────────────────────────────────
 DOWNLOAD_DIR = Path("/downloads")
@@ -155,6 +163,14 @@ def _jackett_api_key() -> str | None:
                 pass
     return None
 
+def _local_http_alive(port: int, path: str = "/") -> bool:
+    """Return true when a localhost HTTP service is reachable."""
+    try:
+        r = httpx.get(f"http://127.0.0.1:{port}{path}", timeout=2, follow_redirects=False)
+        return r.status_code < 500
+    except Exception:
+        return False
+
 # ── App lifecycle ────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -169,15 +185,19 @@ async def lifespan(app: FastAPI):
     if _jackett_proc and _jackett_proc.poll() is None:
         os.killpg(os.getpgid(_jackett_proc.pid), signal.SIGTERM)
 
-app = FastAPI(title="Pirate Dock", version="2.0", lifespan=lifespan)
+app = FastAPI(title="Pirate Dock", version="3.0", lifespan=lifespan)
 
 # ── VPN endpoints ────────────────────────────────────────────
 @app.get("/status")
 async def get_status():
     s = vpn_status()
-    s["jackett_running"] = _jackett_proc is not None and _jackett_proc.poll() is None
+    s["jackett_running"] = (
+        (_jackett_proc is not None and _jackett_proc.poll() is None)
+        or _local_http_alive(JACKETT_PORT, "/")
+    )
     s["jackett_port"] = JACKETT_PORT
     s["jackett_api_key_set"] = bool(JACKETT_API_KEY)
+    s["display_url"] = os.getenv("DISPLAY_URL", "https://araminta.taild3f7b9.ts.net:8443/pirate/")
     return s
 
 @app.post("/vpn/connect")
@@ -372,20 +392,25 @@ async def download_annas(req: AnnaDownloadRequest):
         "status": "info",
     }
 
+    headless_ok = False
     try:
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             resp = await client.get(page_url, headers=headers)
             if resp.status_code == 200:
-                # Look for any direct download links
                 from bs4 import BeautifulSoup
                 soup = BeautifulSoup(resp.text, "lxml")
 
-                # Try to find title from page
                 title_el = soup.select_one('h1, .book-title, .md5card-title')
                 if title_el:
                     download_info["title"] = title_el.get_text(strip=True)
 
-                # Look for download buttons/links
+                # Check for CAPTCHA / challenge markers
+                page_text = resp.text.lower()
+                challenge = any(blocker in page_text for blocker in [
+                    "captcha", "ddos-guard", "challenge",
+                    "just a moment", "please verify", "are you human",
+                ])
+
                 for link in soup.select('a[href]'):
                     href = link.get("href", "")
                     text = link.get_text(strip=True).lower()
@@ -396,10 +421,65 @@ async def download_annas(req: AnnaDownloadRequest):
                                 "url": href,
                             })
 
-                download_info["status"] = "page_loaded"
+                if challenge and not download_info.get("download_links"):
+                    download_info["status"] = "headless_blocked"
+                    download_info["reason"] = "CAPTCHA/challenge detected, no direct links found"
+                else:
+                    download_info["status"] = "page_loaded"
+                    headless_ok = True
+            else:
+                download_info["status"] = "headless_blocked"
+                download_info["reason"] = f"HTTP {resp.status_code}"
     except Exception as e:
-        download_info["status"] = "page_fetch_failed"
-        download_info["error"] = str(e)
+        download_info["status"] = "headless_blocked"
+        download_info["reason"] = str(e)
+
+    # ── Phase 2: Browser fallback ───────────────────────────────
+    if headless_ok and download_info.get("download_links"):
+        return download_info
+
+    if not HAS_BROWSER_FALLBACK:
+        download_info["status"] = "blocked_no_browser"
+        download_info["message"] = (
+            "CAPTCHA blocked headless scraping and browser fallback is not available. "
+            f"Manual download: {page_url}"
+        )
+        return download_info
+
+    try:
+        browser_result = await browser_download(
+            md5,
+            mirror=mirror_base,
+            wait_for_human=120,
+            headless=False,
+        )
+
+        download_info["method"] = "browser"
+        download_info["browser_status"] = browser_result.get("status")
+
+        if browser_result.get("status") == "success":
+            download_info["download_links"] = browser_result.get("download_links", [])
+            download_info["status"] = "success"
+            download_info["message"] = "Download links found via browser fallback."
+        elif browser_result.get("status") == "captcha_required":
+            download_info["status"] = "captcha_waiting"
+            download_info["message"] = browser_result.get("message")
+            if "display_url" in browser_result:
+                download_info["display_url"] = browser_result["display_url"]
+            if "screenshot_path" in browser_result:
+                download_info["screenshot_path"] = browser_result["screenshot_path"]
+            if "screenshot_b64" in browser_result:
+                download_info["screenshot_b64"] = browser_result["screenshot_b64"]
+        elif browser_result.get("status") == "timeout":
+            download_info["status"] = "browser_timeout"
+            download_info["message"] = browser_result.get("message")
+        else:
+            download_info["status"] = "browser_failed"
+            download_info["message"] = browser_result.get("message", browser_result.get("error", "Unknown error"))
+
+    except Exception as e:
+        download_info["status"] = "browser_error"
+        download_info["message"] = f"Browser fallback failed: {e}"
 
     return download_info
 
@@ -409,6 +489,47 @@ async def download_annas_md5(md5: str, name: str | None = None, mirror: str | No
     """Convenience: GET /download/annas-archive/{md5}?name=MyBook"""
     req = AnnaDownloadRequest(md5=md5, optional_name=name, mirror=mirror)
     return await download_annas(req)
+
+# ── Browser status (Playwright inside container) ──────────────
+@app.get("/browser/status")
+async def browser_status():
+    """Check if Playwright Chromium is available inside the container."""
+    if not HAS_BROWSER_FALLBACK:
+        return {"available": False, "reason": "browser_fallback not importable (Playwright missing?)"}
+    from browser_fallback import browser_status as _bf_status
+    return await _bf_status()
+
+# ── Anna's Archive — explicit browser fallback ─────────────────
+@app.post("/download/annas-archive/browser")
+async def download_annas_browser(req: AnnaDownloadRequest, wait: int = 120):
+    """
+    Force browser-based download from Anna's Archive (bypasses headless).
+    Uses Playwright Chromium inside the container — all traffic via VPN.
+    POST body: { "md5": "...", "mirror": "..." (optional) }
+    Query param: wait=120 (seconds to wait for CAPTCHA solve)
+    """
+    if not HAS_BROWSER_FALLBACK:
+        raise HTTPException(
+            status_code=501,
+            detail="Browser fallback not available. Playwright not installed in container."
+        )
+    mirror = req.mirror or ANNAS_MIRRORS[0]
+    vpn_check()
+    result = await browser_download(req.md5, mirror=mirror, wait_for_human=wait, headless=False)
+    return result
+
+@app.get("/download/annas-archive/{md5}/browser")
+async def download_annas_browser_md5(md5: str, mirror: str | None = None, wait: int = 120):
+    """Convenience: GET /download/annas-archive/{md5}/browser?wait=120"""
+    if not HAS_BROWSER_FALLBACK:
+        raise HTTPException(
+            status_code=501,
+            detail="Browser fallback not available. Playwright not installed in container."
+        )
+    m = mirror or ANNAS_MIRRORS[0]
+    vpn_check()
+    result = await browser_download(md5, mirror=m, wait_for_human=wait, headless=False)
+    return result
 
 # ── Torrent search — Jackett ─────────────────────────────────
 @app.get("/search/torrents")

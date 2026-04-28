@@ -9,11 +9,15 @@ category: media
 ## Overview
 A custom-built Docker container running NordVPN (South Africa, P2P), aria2 for downloads, and Jackett for multi-site torrent search. Two parallel pipelines: Anna's Archive for ebooks, Jackett for torrents/video.
 
-**Architecture:** NO browser. NO Playwright. Just HTTP APIs + aria2 + VPN tunnel. All search happens behind NordVPN; if automation can't complete a download, send the user the direct link to click manually.
+**Architecture:** Headless first (HTTP scraping), browser fallback via Playwright + Chromium running **inside** the container when CAPTCHAs, DDoS-Guard, login, or visual confirmation block the normal path. All traffic stays behind NordVPN inside the container. Bridge networking isolates the container's VPN from the host Pi. The human-in-the-loop display is not optional: Minty must be able to send David a URL that shows the container browser.
 **Project home:** `~/Documents/GitHub/pirate-dock/`
 **Container name:** `pirate-dock`
-**API:** `http://localhost:9876`
-**Jackett UI:** `http://localhost:9118`
+**API:** `http://localhost:9876` (published port — no `docker exec` needed)
+**Jackett UI:** `http://localhost:9118` (published port)
+**Human browser display:** `https://araminta.taild3f7b9.ts.net:8443/pirate/` (Tailnet only via Tailscale Serve)
+**Browser fallback:** Container-local Playwright/Chromium — launched inside `pirate-dock`; zero host CDP/browser dependency. Headed Chromium uses container display `:1`, Xpra serves it on container/host port `6081`, and Tailscale Serve exposes it to the Tailnet.
+
+**Tailscale Serve invariant:** `https://araminta.taild3f7b9.ts.net:8443/pirate/` must proxy to `http://127.0.0.1:6081`. Check with `sudo tailscale serve status`. Repair with `sudo tailscale serve --bg --https=8443 --set-path=/pirate 6081`. Use Serve for Tailnet access; do not depend on public Funnel for this workflow, and do not overwrite unrelated root routes on `https://araminta.taild3f7b9.ts.net/`.
 
 ---
 
@@ -26,11 +30,38 @@ cd ~/Documents/GitHub/pirate-dock
 bash scripts/build.sh
 ```
 
+**After container start:** `run.sh` auto-whitelists the Docker bridge subnet (`172.16.0.0/12`) and published ports (9876, 9118, **6081**) inside NordVPN's killswitch. This is required for the host Pi and Tailscale Serve to reach the FastAPI/Jackett/Xpra endpoints while NordVPN is active. If you manually change ports or networking, the whitelist must match.
+
+### Tailscale display URL
+This is the URL Minty should send by WhatsApp when human intervention is needed:
+
+```bash
+https://araminta.taild3f7b9.ts.net:8443/pirate/
+```
+
+Expected Tailscale Serve config:
+
+```bash
+sudo tailscale serve status
+# https://araminta.taild3f7b9.ts.net:8443 (tailnet only)
+# |-- /pirate proxy http://127.0.0.1:6081
+```
+
+If it points anywhere else, repair it:
+
+```bash
+sudo tailscale serve --bg --https=8443 --set-path=/pirate 6081
+```
+
+### Xpra display (inside container)
+When automation hits a visual challenge, `browser_fallback.py` launches Chromium in headed mode on container display `:1`. `run.sh` starts `Xvfb :1` and `xpra shadow :1 --bind-tcp=0.0.0.0:6081 --html=on`, so the browser is visible through the Tailnet URL above.
+
+Do not move the browser to the host. The browser must stay inside the container so its network traffic stays inside NordVPN while the host Pi remains off the VPN.
+
 ### Check status
 ```bash
-docker exec pirate-dock curl -sf http://127.0.0.1:9876/status | python3 -m json.tool
+curl -sf http://localhost:9876/status | python3 -m json.tool
 ```
-Note: External `localhost:9876` may be blocked by VPN kill switch — use `docker exec` instead.
 
 ### View logs
 ```bash
@@ -51,20 +82,27 @@ bash scripts/prune-docker.sh --aggressive  # Nuclear option
 
 ### Skill Tests
 ```bash
-# Run full test suite inside the container
-docker exec pirate-dock python3 /app/scripts/test.py
+# Functional tests (run from host — container must be running)
+python3 scripts/test.py
+
+# Host isolation safety tests (MUST pass before any docker-compose.yml changes)
+python3 scripts/test_isolation.py
 ```
 
-Tests three things:
+Functional tests (test.py) cover:
 1. Anna's Archive search — finds a book and generates download links
 2. Jackett torrent search — lists top 10 UFC video results
 3. Download lifecycle — starts a torrent download, cancels it, deletes partial files
 
+Isolation tests (test_isolation.py) cover:
+- Host iptables are never modified by the container (baseline, while running, after stop)
+- Host Pi can always reach Discord, GitHub, Google while container runs
+- Container is confirmed on bridge networking (not host)
+- API and Jackett are accessible via published ports
+
 ---
 
 ## API Reference (`http://localhost:9876`)
-
-*Note: Use `docker exec pirate-dock curl http://127.0.0.1:9876/...` if VPN kill switch blocks host access.*
 
 ### VPN
 
@@ -79,9 +117,12 @@ Tests three things:
 | Method | Endpoint | Body | Description |
 |--------|----------|------|-------------|
 | GET | `/search/annas-archive?q=...` | — | Search books by title/author/ISBN |
-| POST | `/search/annas-archive` | `{"query": "..."}` | Search (POST version) |
+| POST | `/search/annas-archive` | `{\"query\": \"...\"}` | Search (POST version) |
 | GET | `/download/annas-archive/{md5}` | — | Get download info by MD5 |
-| POST | `/download/annas-archive` | `{"md5": "..."}` | Download by MD5 hash |
+| POST | `/download/annas-archive` | `{\"md5\": \"...\"}` | Download by MD5 hash |
+| POST | `/download/annas-archive/browser` | `{\"md5\": \"...\"}` | **Browser fallback** — navigate with container Playwright, wait for human CAPTCHA solve if needed |
+| GET | `/download/annas-archive/{md5}/browser` | — | **Browser fallback** (GET convenience) |
+| GET | `/browser/status` | — | Check if container browser stack is available and return the display URL |
 
 ### Torrent Search (via Jackett)
 
@@ -157,11 +198,26 @@ Always provide:
 - ✅ Anna's Archive **search** — reliable scraping of search results
 - ✅ Jackett **torrent search** — TPB, 1337x, LimeTorrents, YTS, EZTV configured
 - ✅ **aria2 downloads** via magnet — fast when seeders are healthy
+- ✅ **Container infrastructure** — VPN, Playwright/Chromium, API, Jackett all operational
 
-**What doesn't work automatically:**
-- ❌ Anna's Archive **slow/fast downloads** — DDoS-Guard browser challenge blocks all automated access. Requires manual browser interaction with a proprietary CAPTCHA. No third-party service (Browserbase, Camoufox, Steel) can bypass it reliably.
+**What does NOT work automatically:**
+- ❌ Anna's Archive **free book download automation** (2026-04-26). The container-local browser stack works, but AA's book page DOM has changed. The "Slow Partner Server" button no longer exists. Z-Library mirrors (`.gd`, `.se`, `.li`) return 503 or redirect to parking pages.
 
-**Why no browser automation:** The container is deliberately lightweight (~400MB) and VPN-tunnelled. Outsourcing downloads to third-party browser services (Browserbase, Steel) would route traffic outside the VPN, defeating the privacy model. The architecture is: **container searches, container downloads if possible, user downloads manually if not.**
+**The browser fallback flow (book page navigation) — currently STALLED:**
+1. Headless scraping tries first (fast, no browser needed)
+2. If blocked by CAPTCHA/DDoS-Guard or no direct links, fall back to browser mode automatically
+3. Playwright launches Chromium **inside** `pirate-dock`; every request stays inside the container's NordVPN tunnel
+4. Use the working mirror `https://annas-archive.gl` (the `.li` mirror was redirecting to parking/spam)
+5. Match the browser fingerprint to South Africa: timezone `Africa/Johannesburg`, locale `en-GB`, user-agent `Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36`
+6. **BLOCKED HERE**: AA's Downloads page now shows Z-Library mirrors, but Z-Library itself is down (503). The old "Slow Partner Server" path is gone.
+7. **Human-in-the-loop fallback**. When automation fails, Chromium can launch in **headed mode** on display `:1`, visible through `https://araminta.taild3f7b9.ts.net:8443/pirate/`. A human can interact with the browser inside the VPN tunnel to solve CAPTCHAs or click download links manually. The script then captures the resulting download URL or file.
+8. File downloads via `curl --insecure --location` to `/downloads` — only works if a valid download URL is found
+
+**What does NOT work automatically (known gap):**
+- ❌ AA free book downloads — need a new download path or redesign to torrent/tor mirrors
+- ❌ Title parsing is still flaky in some AA layouts — MD5 extraction works reliably, but titles can still show as "Unknown" when the nested DOM shifts.
+
+**Architecture note:** The container keeps the browser work inside the same network namespace as NordVPN; no host CDP browser stack is required for the AA flow. Bridge networking is still the right choice. Host networking remains forbidden — see safety note below.
 
 **Seeder count caveat:** Torznab seeder counts (especially from TPB) may show 0 even when torrents are alive and downloadable. Always try downloading before reporting "no seeders" to the user.
 
@@ -200,17 +256,47 @@ Always provide:
 
 ## Known Issues — RESOLVED
 
-- **VPN login bug (2026-04-14).** Token read from bind-mounted file (`/run/pirate-dock/token`) instead of env vars (s6-overlay strips env vars).
-- **Jackett indexers (2026-04-14).** TPB, 1337x, LimeTorrents, YTS, EZTV all enabled and returning results.
-- **Anna's Archive search URL (2026-04-14).** AA changed `/s?q=` to `/search?q=`. Fixed in `server.py`.
-- **Anna's Archive HTML parser (2026-04-14).** New UI uses `.js-aarecord-list-outer` container with flex/border-b child divs. Updated `_parse_annas_search()`.
-- **Jackett startup deadlock (2026-04-14).** `_start_jackett()` now checks for already-running Jackett before starting a new process; accepts HTTP 302 in addition to 200 (Jackett returns 302 for the indexers endpoint).
+- VPN login bug (2026-04-14). Token read from bind-mounted file (`/run/pirate-dock/token`) instead of env vars (s6-overlay strips env vars).
+- Jackett indexers (2026-04-14). TPB, 1337x, LimeTorrents, YTS, EZTV all enabled and returning results.
+- Anna's Archive search URL (2026-04-14). AA changed `/s?q=` to `/search?q=`. Fixed in `server.py`.
+- Anna's Archive HTML parser (2026-04-14). New UI uses `.js-aarecord-list-outer` container with flex/border-b child divs. Updated `_parse_annas_search()`.
+- Jackett startup deadlock (2026-04-14). `_start_jackett()` now checks for already-running Jackett before starting a new process; accepts HTTP 302 in addition to 200 (Jackett returns 302 for the indexers endpoint).
+- NordVPN killswitch leaked to host Pi (2026-04-17). RESOLVED. Root cause: `network_mode: host` + `CAP_NET_ADMIN` caused NordVPN's iptables killswitch to apply to the Pi's own network namespace, blocking Discord, GitHub, and all non-local Pi connectivity for ~12 hours. Fix: switched to bridge networking — NordVPN's killswitch now operates inside the container's own namespace and physically cannot affect the host. The `test_isolation.py` suite is a regression guard.
+- Docker bridge + killswitch blocked host-to-container API (2026-04-26). RESOLVED. When NordVPN connects inside the container with killswitch enabled, Docker bridge traffic (from host `172.19.0.1`) was dropped. Fix: `run.sh` now auto-whitelists the Docker bridge subnet and published ports (9876, 9118, **6081**) via `nordvpn whitelist add subnet 172.16.0.0/12`, `nordvpn whitelist add port 9876`, `nordvpn whitelist add port 9118`, `nordvpn whitelist add port 6081`. Container must restart to apply. The host can now reach the FastAPI, Jackett, and Xpra endpoints while NordVPN is active.
+- Playwright runtime installation failure (2026-04-26). RESOLVED. `playwright install chromium` was failing inside the container due to missing shared libraries. Fix: Dockerfile now installs `libnss3`, `xvfb`, and other Chromium system deps at image build time. Chromium is baked into the image at `/root/.cache/ms-playwright/`.
+- Anna's Archive downloads CAPTCHA — old host-CDP approach (2026-04-16). OBSOLETE. Originally used host CDP on port 9222 with xpra. Replaced by container-local Playwright (see 2026-04-26). Host CDP dependency removed.
+- **Old VNC/noVNC approach (2026-04-27).** OBSOLETE. The current display stack is `Xvfb :1` plus `xpra shadow :1` inside the container, served on port `6081` and exposed to the Tailnet by Tailscale Serve. Do not reintroduce noVNC ports (`5998`/`5999`) or host display `:99` for this workflow.
 
 ## Known Issues — CURRENT
 
-- **Anna's Archive downloads: CAPTCHA-GATED.** DDoS-Guard on `/slow_download/` and `/fast_download/` requires manual browser verification. Solution: provide the user with the direct Anna's Archive link for manual download.
 - **Anna's Archive title extraction:** The parser extracts MD5 hashes correctly but titles show as "Unknown" — the title lives in a complex nested DOM structure that needs further parsing work.
 - **Jackett seeder counts via Torznab:** Consistently report 0 seeders even when torrents are alive. TPB's Torznab adapter doesn't report accurate seeder data.
+
+**SOP for Anna's Archive downloads (updated 2026-04-28):**
+1. Automation first — `browser_download()` navigates book page, identifies and clicks the best download candidate (not hardcoded "Slow Partner Server" — AA DOM changes; it scores all links by download-likeness keywords)
+2. If DDoS-Guard JS challenge: wait up to 30s for auto-redirect
+3. If DDoS-Guard visual puzzle, hCAPTCHA, login, or another manual block appears, the container takes a screenshot and returns `screenshot_b64` plus `display_url`. Minty/the calling agent may use its own vision capability outside the container, or send David the Tailnet display URL.
+4. Human-in-the-loop URL: `https://araminta.taild3f7b9.ts.net:8443/pirate/`
+5. After challenge resolves → countdown page detected → `_handle_countdown_and_extract()` polls up to 180s:
+   - Scans all `<a>`, `<button data-clipboard-text>`, `<input>`, `<textarea>` for token URLs matching `wbsg8v.xyz` or `/d3/y/`
+   - Falls back to page redirect detection (`page.url` itself becoming the token)
+   - Extracts cookies, curls file to `/downloads` with proper headers
+6. Token URL pattern learned: `https://wbsg8v.xyz/d3/y/{unix_ts}/3000/g4/{category}/...`
+
+**URL for human-in-the-loop:** `https://araminta.taild3f7b9.ts.net:8443/pirate/`
+
+---
+
+## Architecture Principles (never violate)
+
+### Lessons learned (2026-04-27)
+**Do not put LLM/vision providers or API keys inside container tools.** The container cannot import agent capabilities, and it should not call OpenRouter/OpenAI/Gemini/etc. directly. Correct boundary: `browser_fallback.py` returns screenshots and the live display URL; Minty/the calling agent decides whether to use its own vision capability or send David the Xpra link. Keep container dependencies minimal and keep credentials out of this repo/container unless they are required for VPN/indexer operation.
+
+1. **All VPN traffic originates from INSIDE the container.** Never install/run NordVPN on the host Pi.
+2. **Container is disposable:** `docker compose down && up` should restore everything.
+3. **Host-to-container ports:** API and Jackett stay localhost-only (`127.0.0.1:9876`, `127.0.0.1:9118`). Xpra display is published as host port `6081` because Tailscale Serve proxies it to the Tailnet URL.
+4. **Auto-whitelist Docker bridge subnet** in NordVPN on startup so killswitch doesn't block host access.
+5. **If you need to interact with the browser from within the VPN tunnel, use the Tailnet Xpra URL** (`https://araminta.taild3f7b9.ts.net:8443/pirate/`) — never run a browser on the host and route through the container.
 
 ---
 
@@ -220,6 +306,10 @@ Always provide:
 - Jackett state persisted in `pirate-dock-data` Docker volume at `/data/jackett/`
 - Build scripts include disk space guardrails (refuses to build above 85% usage)
 - `.dockerignore` prevents build context bloat (no .git, downloads, docs inside image)
-- Image is ~400MB (no Chromium!) vs old 2.77GB
-- VPN kill switch blocks non-VPN traffic — use `docker exec` for local API calls from the host
+- Image is ~1.5 GB with Playwright + Chromium baked in (was ~400 MB before browser fallback)
+- VPN kill switch blocks non-VPN traffic INSIDE the container — this is correct and desired. Host networking is unaffected.
 - Token is 64 chars, stored in `.env` and `scripts/token.txt` — never commit `token.txt` to git
+- **Browser stack runs INSIDE the container** via Playwright; no host CDP or xpra required for the AA flow
+- **Network mode** is bridge (NOT host) — ports 9876 and 9118 published to `127.0.0.1` only
+- **DO NOT change to `network_mode: host`** — this would re-introduce the 2026-04-17 incident where NordVPN's killswitch broke all Pi connectivity
+- **Playwright requirements:** `playwright>=1.50.0` in `requirements.txt`; Dockerfile installs Chromium libs + runs `playwright install chromium`

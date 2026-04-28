@@ -23,6 +23,7 @@ from pathlib import Path
 import warnings
 
 DOWNLOAD_DIR = Path("/downloads")
+DISPLAY_URL = os.environ.get("DISPLAY_URL", "https://araminta.taild3f7b9.ts.net:8443/pirate/")
 
 # Anna's Archive mirrors (tried in order; .li is DEAD — see skill notes)
 ANNAS_MIRRORS = [
@@ -250,7 +251,7 @@ async def browser_download(
     md5: str,
     mirror: str | None = None,
     wait_for_human: int = 120,
-    headless: bool = True,
+    headless: bool = False,
 ) -> dict:
     """
     Navigate Anna's Archive, click Slow Partner Server, handle DDoS-Guard/CAPTCHA.
@@ -318,7 +319,7 @@ async def browser_download(
             slow_links = [lnk for _, lnk in scored]
 
             if not slow_links:
-                display_url = os.environ.get("DISPLAY_URL", "http://100.65.212.67:6081/index.html")
+                display_url = DISPLAY_URL
                 result["status"] = "no_links_found"
                 result["message"] = (
                     f"No download links found on book page. "
@@ -366,7 +367,7 @@ async def browser_download(
                     # ── Visual challenge — take screenshot, return to calling agent ─
                     # The calling agent (Minty) uses its own vision model if available.
                     # If not, it sends the display URL to the user for manual solving.
-                    display_url = os.environ.get("DISPLAY_URL", "http://100.65.212.67:6081/index.html")
+                    display_url = DISPLAY_URL
                     screenshot_path = DOWNLOAD_DIR / f"captcha_{md5}.png"
                     screenshot_b64 = None
                     try:
@@ -443,16 +444,17 @@ async def browser_download(
 
 async def browser_status() -> dict:
     """Check if browser stack is available."""
+    status = {"display_url": DISPLAY_URL}
     if not _check_playwright():
-        return {"available": False, "reason": "playwright not installed"}
+        return {**status, "available": False, "reason": "playwright not installed"}
     try:
         from playwright.async_api import async_playwright
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
             await browser.close()
-            return {"available": True, "type": "local_chromium", "via": "container"}
+            return {**status, "available": True, "type": "local_chromium", "via": "container"}
     except Exception as e:
-        return {"available": False, "reason": str(e)}
+        return {**status, "available": False, "reason": str(e)}
 
 
 # ── Back-compat aliases for old server.py imports ─────────────────────────

@@ -18,23 +18,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
     libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 \
     libatspi2.0-0 libx11-6 libxext6 libxfixes3 libxrender1 \
-    xvfb dbus-x11 xfonts-base x11-utils x11vnc \
-    openbox \
+    xvfb dbus-x11 xfonts-base x11-utils xpra \
     && rm -rf /var/lib/apt/lists/*
-
-# ── noVNC HTML5 client (tarball has vnc.html; pip package does not) ──
-RUN curl -L -o /tmp/novnc.tar.gz \
-        https://github.com/novnc/noVNC/archive/v1.3.0.tar.gz \
-    && tar xzf /tmp/novnc.tar.gz -C /tmp \
-    && mv /tmp/noVNC-1.3.0 /opt/novnc \
-    && rm /tmp/novnc.tar.gz
 
 # ── Python deps + Playwright Chromium + Camoufox Firefox ─────
 COPY scripts/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt \
     && playwright install chromium \
     && playwright install-deps chromium \
-    && python -m camoufox install
+    && python3 -m camoufox fetch
 
 # ── Jackett (multi-arch aware) ───────────────────────────────
 ARG TARGETARCH
@@ -60,6 +52,6 @@ COPY scripts/browser_fallback.py /app/browser_fallback.py
 
 # ── Volumes & ports ──────────────────────────────────────────
 VOLUME /downloads /data
-EXPOSE 9876 9118 5998
+EXPOSE 9876 9118 6081
 
 CMD ["/app/scripts/run.sh"]

@@ -35,26 +35,25 @@ fi
 JACKETT_BIN="/opt/jackett/jackett"
 JACKETT_DATA="/data/jackett"
 
-# ── Display / VNC stack ────────────────────────────────────────
+# ── Display / xpra stack ────────────────────────────────────────
 # Xvfb :1    — virtual framebuffer (no physical display needed)
-# x11vnc     — attaches to Xvfb, speaks VNC on localhost:5901
-# websockify — bridges VNC → WebSocket at port 5998 with noVNC HTML5 client
-echo "[vnc] Starting Xvfb + x11vnc + noVNC..."
+# xpra       — shadows Xvfb and serves the HTML5 client on port 6081
+echo "[display] Starting Xvfb + xpra..."
 export DISPLAY=:1
 Xvfb :1 -screen 0 1280x800x24 -ac +extension GLX +render -noreset &
 sleep 1
-openbox &
-sleep 1
-x11vnc -display :1 -rfbport 5901 -nopw -forever -localhost -quiet &
-sleep 1
-websockify --web /opt/novnc 5998 localhost:5901 &
-NOVNC_URL="${NOVNC_URL:-http://100.65.212.67:5998/vnc.html}"
-echo "[vnc] noVNC ready: $NOVNC_URL"
+xpra shadow :1 \
+    --bind-tcp=0.0.0.0:6081 \
+    --tcp-auth=none \
+    --html=on \
+    --no-daemon &
+DISPLAY_URL="${DISPLAY_URL:-http://100.65.212.67:6081/index.html}"
+echo "[display] xpra HTML5 ready: $DISPLAY_URL"
 
 echo "━━━ Pirate Dock v3 ━━━"
 echo "API:     http://0.0.0.0:9876"
 echo "Jackett: http://0.0.0.0:${JACKETT_PORT}"
-echo "noVNC:   $NOVNC_URL"
+echo "Display: $DISPLAY_URL"
 
 # ── Wait for NordVPN daemon (started by s6 /init) ─────────────
 echo "[vpn] Waiting for NordVPN daemon..."
@@ -78,7 +77,7 @@ if [ -n "${NORDVPN_TOKEN:-}" ]; then
     nordvpn login --token "$NORDVPN_TOKEN" 2>&1 && echo "[vpn] Login OK." || echo "[vpn] Login FAILED."
 fi
 
-# ── Auto-whitelist Docker bridge so host can reach API / Jackett / noVNC ─
+# ── Auto-whitelist Docker bridge so host can reach API / Jackett / xpra ─
 if command -v ip >/dev/null 2>&1; then
     BRIDGE_SUBNET=$(ip -4 route | awk '/default/ {next} /docker0|br-/ {print $1}' | head -1)
     if [ -n "$BRIDGE_SUBNET" ] && [ "$BRIDGE_SUBNET" != "0.0.0.0/0" ] && [ "$BRIDGE_SUBNET" != "127.0.0.0/8" ]; then
@@ -94,7 +93,7 @@ fi
 nordvpn whitelist add subnet 127.0.0.0/8 2>/dev/null || true
 nordvpn whitelist add port 9876 2>/dev/null || true
 nordvpn whitelist add port 9118 2>/dev/null || true
-nordvpn whitelist add port 5998 2>/dev/null || true
+nordvpn whitelist add port 6081 2>/dev/null || true
 
 # ── Connect VPN in background — don't block Jackett / API startup ─
 (

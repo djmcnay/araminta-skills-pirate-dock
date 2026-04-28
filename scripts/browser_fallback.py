@@ -7,7 +7,7 @@ launches within the container's network namespace.
 When headless scraping hits a CAPTCHA or DDoS-Guard visual challenge:
   A) A screenshot is taken and returned as base64 — the calling agent
      can use its own vision model to decide what to do.
-  B) The noVNC URL is returned so the user can view/interact via browser.
+  B) The display URL is returned so the user can view/interact via browser.
   C) The browser waits in headed mode (DISPLAY=:1) for the human to solve.
   D) Once the page advances, download extraction resumes automatically.
 
@@ -318,11 +318,11 @@ async def browser_download(
             slow_links = [lnk for _, lnk in scored]
 
             if not slow_links:
-                novnc_url = os.environ.get("NOVNC_URL", "http://100.65.212.67:5998/vnc.html")
+                display_url = os.environ.get("DISPLAY_URL", "http://100.65.212.67:6081/index.html")
                 result["status"] = "no_links_found"
                 result["message"] = (
                     f"No download links found on book page. "
-                    f"Open the browser to inspect: {novnc_url}"
+                    f"Open the browser to inspect: {display_url}"
                 )
                 return result
 
@@ -365,8 +365,8 @@ async def browser_download(
                 if state["challenge"] in ("ddos_guard_manual", "captcha"):
                     # ── Visual challenge — take screenshot, return to calling agent ─
                     # The calling agent (Minty) uses its own vision model if available.
-                    # If not, it sends the noVNC URL to the user for manual solving.
-                    novnc_url = os.environ.get("NOVNC_URL", "http://100.65.212.67:5998/vnc.html")
+                    # If not, it sends the display URL to the user for manual solving.
+                    display_url = os.environ.get("DISPLAY_URL", "http://100.65.212.67:6081/index.html")
                     screenshot_path = DOWNLOAD_DIR / f"captcha_{md5}.png"
                     screenshot_b64 = None
                     try:
@@ -376,10 +376,10 @@ async def browser_download(
                         screenshot_path = None
 
                     result["status"] = "captcha_required"
-                    result["novnc_url"] = novnc_url
+                    result["display_url"] = display_url
                     result["message"] = (
                         f"Visual CAPTCHA/DDoS-Guard challenge detected. "
-                        f"Open the browser to solve it: {novnc_url} — "
+                        f"Open the browser to solve it: {display_url} — "
                         f"I'll wait up to {wait_for_human}s."
                     )
                     if screenshot_path and Path(screenshot_path).exists():
@@ -387,7 +387,7 @@ async def browser_download(
                     if screenshot_b64:
                         result["screenshot_b64"] = screenshot_b64
 
-                    # Wait for page URL to change (human solves via noVNC)
+                    # Wait for page URL to change (human solves via xpra)
                     previous_url = page.url
                     for _ in range(wait_for_human // 2):
                         await asyncio.sleep(2)

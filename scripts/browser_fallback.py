@@ -50,7 +50,50 @@ def _check_playwright():
         return False
 
 
-async def _launch_browser(p, headless=True):
+async def _launch_camoufox(p, headless=True):
+    """Launch Camoufox — Firefox-based anti-fingerprint browser.
+    Returns (browser, page) tuple, or (None, None) on failure.
+    """
+    try:
+        from camoufox.async_api import AsyncNewBrowser
+        os.environ['DISPLAY'] = ':1'
+        browser = await AsyncNewBrowser(p, headless=headless)
+        page = await browser.new_page()
+        return browser, page
+    except ImportError:
+        return None, None
+    except Exception as e:
+        warnings.warn(f"Camoufox launch failed: {e}")
+        return None, None
+
+
+async def _click_hcaptcha_checkbox(page) -> bool:
+    """Try to click the hCaptcha 'I am human' checkbox.
+    Returns True if checkbox was found and clicked, False otherwise.
+    """
+    try:
+        for frame in page.frames:
+            if 'hcaptcha' in (frame.url or ''):
+                cb = await frame.wait_for_selector(
+                    '#checkbox, input[type=checkbox], .checkbox, [role=checkbox]',
+                    timeout=5000
+                )
+                if cb:
+                    await cb.click()
+                    return True
+        # Try directly in main page
+        cb = await page.wait_for_selector(
+            'iframe[src*="hcaptcha"] >> #checkbox', timeout=3000
+        )
+        if cb:
+            await cb.click()
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def _launch_browser(p, headless=True, use_camoufox=True):
     """Launch Chromium with stealth args."""
     args = [
         "--no-sandbox",
@@ -283,8 +326,21 @@ async def browser_download(
 
     async with async_playwright() as p:
         browser = None
+        page = None
+        use_camoufox = True
         try:
-            browser, page = await _launch_browser(p, headless=headless)
+            # ── Attempt 1: Camoufox headless ──
+            result['method'] = 'camoufox_headless'
+            browser, page = await _launch_camoufox(p, headless=True)
+            if browser is None:
+                # ── Attempt 2: Camoufox headed ──
+                result['method'] = 'camoufox_headed'
+                browser, page = await _launch_camoufox(p, headless=False)
+            if browser is None:
+                # ── Attempt 3: Playwright Chromium headed ──
+                result['method'] = 'playwright_headed'
+                use_camoufox = False
+                browser, page = await _launch_browser(p, headless=headless)
 
             # ── Step 1: Navigate to book page ──
             await page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
@@ -364,9 +420,7 @@ async def browser_download(
                     continue
 
                 if state["challenge"] in ("ddos_guard_manual", "captcha"):
-                    # ── Visual challenge — take screenshot, return to calling agent ─
-                    # The calling agent (Minty) uses its own vision model if available.
-                    # If not, it sends the display URL to the user for manual solving.
+                    # ── Visual challenge ──
                     display_url = DISPLAY_URL
                     screenshot_path = DOWNLOAD_DIR / f"captcha_{md5}.png"
                     screenshot_b64 = None
@@ -376,6 +430,32 @@ async def browser_download(
                     except Exception:
                         screenshot_path = None
 
+                    # Attempt 1: Click checkbox ourselves
+                    cb_clicked = await _click_hcaptcha_checkbox(page)
+                    if cb_clicked:
+                        await asyncio.sleep(3)
+                        # Check if puzzle appeared or we passed
+                        body2 = await page.evaluate('() => document.body.innerText')
+                        if 'I am human' not in body2 and 'Checking' not in await page.title():
+                            state3 = await _detect_challenge(page)
+                            if state3.get("download_links"):
+                                result["status"] = "success"
+                                result["download_links"] = state3["download_links"]
+                                result["message"] = "Download links found after auto-checkbox."
+                                return result
+                            if state3["challenge"] == "countdown":
+                                countdown_result = await _handle_countdown_and_extract(page)
+                                if countdown_result["status"] == "success":
+                                    result["status"] = "success"
+                                    result["download_links"] = [{"text": "direct", "url": countdown_result["token_url"]}]
+                                    result["file_path"] = countdown_result["file_path"]
+                                    result["message"] = countdown_result["message"]
+                                    return result
+                            # Puzzle appeared — fall through to human
+                            await page.screenshot(path=str(screenshot_path))
+                            screenshot_b64 = _screenshot_b64(str(screenshot_path))
+
+                    # Return to calling agent with screenshot for puzzle solving
                     result["status"] = "captcha_required"
                     result["display_url"] = display_url
                     result["message"] = (

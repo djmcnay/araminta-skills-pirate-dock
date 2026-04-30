@@ -12,7 +12,8 @@ services:
     ports:
       - "127.0.0.1:9876:9876" # API — localhost only
       - "127.0.0.1:9118:9118" # Jackett UI — localhost only
-      - "6081:6081"           # xpra HTML5 — Tailscale Funnel proxies this to the Browser URL
+      - "6081:6081"           # websockify/noVNC — Tailscale Funnel proxies this to the Browser URL
+      - "9223:9223"           # Chrome DevTools Protocol — Minty's remote control
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:

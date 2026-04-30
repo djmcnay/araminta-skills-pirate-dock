@@ -19,6 +19,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 \
     libatspi2.0-0 libx11-6 libxext6 libxfixes3 libxrender1 \
     xvfb dbus-x11 xfonts-base x11-utils x11vnc novnc websockify \
+    libgtk-3-0 libgtk2.0-0 libdbus-glib-1-2 libxt6 libxrender1 \
+    libxcomposite1 libxdamage1 libxfixes3 libasound2 libxrandr2 \
+    libcups2 libpango-1.0-0 libatk1.0-0 libatk-bridge2.0-0 \
+    firefox-esr \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Python deps + Playwright Chromium + Camoufox Firefox ─────

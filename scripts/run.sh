@@ -94,6 +94,7 @@ nordvpn whitelist add subnet 127.0.0.0/8 2>/dev/null || true
 nordvpn whitelist add port 9876 2>/dev/null || true
 nordvpn whitelist add port 9118 2>/dev/null || true
 nordvpn whitelist add port 6081 2>/dev/null || true
+nordvpn whitelist add port 9223 2>/dev/null || true
 
 # ── Connect VPN in background — don't block Jackett / API startup ─
 (

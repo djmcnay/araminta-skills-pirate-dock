@@ -6,61 +6,62 @@
 
 ---
 
-## What We Learned (v3.2, 2026-04-30)
+## Session Outcome: PARTIAL SUCCESS
+
+**Container:** Fully operational. Rebuilds clean, VPN connects, CDP reachable, display stack visible via VNC.
+**Book page:** Loads without CAPTCHA on first visit.
+**Download:** BLOCKED by hCaptcha trigger on download button click.
+
+---
+
+## Critical Learnings (2026-04-30, final)
 
 ### What WORKS
 - **Display stack:** Xvfb :1 → x11vnc :5900 → websockify :6081 → noVNC. Rock solid.
 - **VPN:** NordVPN South Africa, NordLynx P2P, killswitch on. Bridge networking. Docker subnet whitelisted.
 - **API/Jackett:** FastAPI on :9876, Jackett on :9118. Both operational.
-- **Chromium inside container:** Playwright Chromium 1217 launches headed on :1. `--no-sandbox` required.
-- **VNC visibility:** `https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F` — David can see the browser.
+- **Persistent Chromium CDP:** Launched once by run.sh, connect_over_cdp() works. Port 9223.
+- **VNC visibility:** David can see and interact with the browser.
+- **Human CAPTCHA solve:** David solved hCaptcha via VNC — it works. The persistent browser tab advanced past the challenge.
+- **Three-step API design:** navigate/wait/extract is the right abstraction.
 
 ### What DOES NOT WORK
 
-1. **Camoufox headless + DDoS-Guard JS challenges.** The JS redirect never fires in headless mode. The DDoS-Guard "checking your browser" page just sits there indefinitely. Tier 1 of our fallback is dead on arrival.
+1. **hCaptcha sessions are PER-TAB, not per-browser.** The fundamental mistake: browser_extract_download() calls connect_over_cdp() which creates a NEW tab, navigates fresh, and gets its OWN hCaptcha challenge. David solving via VNC in a different tab (the persistent about:blank that run.sh launched) does nothing for the extract tab. The extract tab polls for token URLs that will never appear because it's stuck on its own hCaptcha wall.
 
-2. **hCaptcha checkbox auto-click via Playwright/CDP.** The checkbox lives in a cross-origin `<iframe>` from `hcaptcha.com`. Playwright's `frame.wait_for_selector` can find the iframe but cannot reach *into* it to click the checkbox — same-origin policy blocks it. CDP's `Runtime.evaluate` hits the same wall. There is no programmatic way to click hCaptcha's "I am human" checkbox from outside the iframe.
+2. **Extract timeouts mask the VNC gap.** The 180s timeout in browser_extract_download expires long after David might have solved the CAPTCHA in the wrong tab. The function returns "timeout" but the real issue is that it never connected to the right tab.
 
-3. **Anna's Archive DOM has changed (2026-04).** The "Slow Partner Server" button that `browser_fallback.py` hunts for no longer exists. Z-Library mirrors return 503. The download path has shifted to different buttons/links.
+3. **wait_for_change was never wired into the flow.** This function exists and is correct — it navigates to the book page and polls URL changes. But the production flow went navigate → extract, skipping wait entirely. The extract function has its own internal polling that's designed for the old monolithic approach.
 
-4. **Camoufox adds complexity without benefit.** The only advantage over plain Chromium is anti-fingerprinting, but Anna's Archive's DDoS-Guard doesn't fingerprint aggressively enough for it to matter — it uses JS challenges + hCaptcha, both of which block Camoufox and Chromium equally.
+4. **No tab-sharing between functions.** Each function (navigate, wait, extract) calls connect_over_cdp independently, creating separate Playwright connections. There's no mechanism for "use the same tab David just solved in."
 
-### Architecture Decision
+### The Fix (for tomorrow)
 
-**Abandon the monolithic "launch browser → find buttons → auto-click → hope" model.** The script has too many assumptions about AA's DOM baked in, and every AA change breaks it.
+The three-step flow MUST use the same browser tab throughout:
 
-Instead: **CDP-driven control.** Chromium launches with `--remote-debugging-port=9223`. Minty controls it step-by-step via CDP — navigate, evaluate JS to find elements, click, screenshot, detect page changes. David only touches visual hCaptcha puzzles via the VNC link.
+**Option A: Single-session approach (recommended for now)**
+- browser_navigate() creates a page, navigates to book page
+- If captcha_visual: return VNC link, but KEEP THE PAGE OPEN (don't close browser)
+- David solves via VNC on that same page
+- browser_wait_for_change() should connect and find the EXISTING page that already passed hCaptcha, or create a new one that re-navigates (cookies/session may persist)
+- browser_extract_download() should use the same approach
 
-This mirrors exactly how the host browser stack works (browser-setup skill, port 9222 pattern) — proven and reliable.
+**Option B: Cookie/session persistence**
+- The persistent Chromium shares cookies across tabs
+- After David solves hCaptcha, the session cookie is set
+- A fresh navigation in a new tab should bypass the challenge
+- This MAY work but isn't guaranteed — DDoS-Guard may still challenge new tabs
 
----
+**Option C: Direct CDP control (most reliable)**
+- Don't use Playwright's connect_over_cdp at all
+- Use raw CDP commands to find the existing tab, evaluate JS, click elements, detect URL changes
+- This avoids the "new connection = new tab" problem entirely
 
-## v3.3 Rebuild Plan
+### For tomorrow's iPhone production test
 
-### Phase 1: Rewrite browser_fallback.py
-Replace 400-line monolith with three clean functions:
-- `navigate(md5)` — opens book page, returns screenshot + page state
-- `wait_for_page_change(timeout)` — polls page URL, returns when navigation happens
-- `extract_download()` — finds download links, curls file to /downloads
-
-No Camoufox. No hCaptcha auto-click. No button-hunting heuristics.
-
-### Phase 2: CDP control endpoint
-Add `GET /browser/cdp` that returns the CDP WebSocket URL so Minty can connect directly.
-Chromium launches from run.sh with `--remote-debugging-port=9223`.
-
-### Phase 3: Rebuild & test
-- `docker compose down`
-- Update Dockerfile (remove Camoufox dep if clean, or keep it isolated)
-- `bash scripts/build.sh --no-cache`
-- Test: launch browser, navigate to AA, actually try to download Japaneasy
-
-### Phase 4: Leave status for David
-By morning David should see:
-- Container running, VPN connected
-- Browser launched on AA book page
-- Either: download complete (file in /downloads) OR VNC link with hCaptcha waiting
-- Status messages documenting every step
+1. Navigate: trigger browser_navigate, if captcha → send VNC link
+2. David solves via VNC on phone
+3. Immediately call browser_extract_download — the persistent Chromium may have cached the session and a fresh navigation might sail through. If not, we iterate.
 
 ---
 
@@ -77,5 +78,10 @@ By morning David should see:
 | 22:20 | `docker compose down` + `bash scripts/build.sh --no-cache` | BUILDING in background |
 | 22:40 | Build complete, container up, VPN connected | ✓ API OK, CDP OK, Jackett OK |
 | 22:42 | Navigate to Japaneasy page (browser_navigate) | ✓ download_ready — page loaded clean, no challenge |
-| 22:45 | Extract download (browser_extract_download) | hCaptcha triggered after clicking download button |
-| 22:50 | Status left for David — VNC link waiting | Awaiting human puzzle solve: https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F |
+| 22:45 | Extract download (browser_extract_download run 1) | hCaptcha triggered after clicking download button |
+| 22:50 | Status left for David — VNC link waiting | Awaiting human puzzle solve |
+| 23:03 | Production run: navigate | ✓ download_ready again |
+| 23:04 | Production run: extract (run 2) | hCaptcha — stuck screenshot captured |
+| 23:08 | David solved hCaptcha via VNC | ✓ Human solve works, page advanced |
+| 23:09 | Production run: extract (run 3) | curl exit 28 — connection lost |
+| 23:15 | Session halted by David | Learnings captured below |

@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb dbus-x11 xfonts-base x11-utils x11vnc novnc websockify \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Python deps + Playwright Chromium + Camoufox Firefox ─────
+# ── Python deps + Playwright Chromium ─────────────────────────
 COPY scripts/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt \
     && playwright install chromium \

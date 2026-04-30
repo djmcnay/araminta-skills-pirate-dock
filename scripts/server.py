@@ -23,9 +23,14 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import httpx
 
-# Browser fallback — Playwright inside the container
+# Browser fallback — CDP-driven, connects to persistent Chromium
 try:
-    from browser_fallback import browser_download
+    from browser_fallback import (
+        browser_navigate,
+        browser_wait_for_change,
+        browser_extract_download,
+        browser_status as _bf_status_raw,
+    )
     HAS_BROWSER_FALLBACK = True
 except ImportError:
     HAS_BROWSER_FALLBACK = False
@@ -447,35 +452,31 @@ async def download_annas(req: AnnaDownloadRequest):
         return download_info
 
     try:
-        browser_result = await browser_download(
-            md5,
-            mirror=mirror_base,
-            wait_for_human=120,
-            headless=False,
-        )
+        browser_result = await browser_navigate(md5, mirror=mirror_base)
 
-        download_info["method"] = "browser"
-        download_info["browser_status"] = browser_result.get("status")
+        download_info["method"] = "cdp_navigate"
+        download_info["browser_state"] = browser_result.get("state")
 
-        if browser_result.get("status") == "success":
-            download_info["download_links"] = browser_result.get("download_links", [])
-            download_info["status"] = "success"
-            download_info["message"] = "Download links found via browser fallback."
-        elif browser_result.get("status") == "captcha_required":
-            download_info["status"] = "captcha_waiting"
-            download_info["message"] = browser_result.get("message")
-            if "display_url" in browser_result:
-                download_info["display_url"] = browser_result["display_url"]
-            if "screenshot_path" in browser_result:
-                download_info["screenshot_path"] = browser_result["screenshot_path"]
-            if "screenshot_b64" in browser_result:
-                download_info["screenshot_b64"] = browser_result["screenshot_b64"]
-        elif browser_result.get("status") == "timeout":
-            download_info["status"] = "browser_timeout"
-            download_info["message"] = browser_result.get("message")
+        if browser_result.get("status") == "ok":
+            if browser_result.get("state") == "download_ready":
+                download_info["download_links"] = browser_result.get("download_links", [])
+                download_info["status"] = "success"
+                download_info["message"] = "Download links found via browser."
+            elif browser_result.get("state") == "captcha_visual":
+                download_info["status"] = "captcha_waiting"
+                download_info["message"] = browser_result.get("message")
+                if "display_url" in browser_result:
+                    download_info["display_url"] = browser_result["display_url"]
+                if "screenshot_path" in browser_result:
+                    download_info["screenshot_path"] = browser_result["screenshot_path"]
+                if "screenshot_b64" in browser_result:
+                    download_info["screenshot_b64"] = browser_result["screenshot_b64"]
+            else:
+                download_info["status"] = "browser_" + browser_result.get("state", "unknown")
+                download_info["message"] = browser_result.get("message", "Unknown browser state")
         else:
-            download_info["status"] = "browser_failed"
-            download_info["message"] = browser_result.get("message", browser_result.get("error", "Unknown error"))
+            download_info["status"] = "browser_error"
+            download_info["message"] = browser_result.get("message", "Browser navigation failed")
 
     except Exception as e:
         download_info["status"] = "browser_error"
@@ -490,46 +491,105 @@ async def download_annas_md5(md5: str, name: str | None = None, mirror: str | No
     req = AnnaDownloadRequest(md5=md5, optional_name=name, mirror=mirror)
     return await download_annas(req)
 
-# ── Browser status (Playwright inside container) ──────────────
+# ── Browser status (persistent Chromium CDP) ──────────────────
 @app.get("/browser/status")
 async def browser_status():
-    """Check if Playwright Chromium is available inside the container."""
+    """Check if persistent Chromium CDP is reachable."""
     if not HAS_BROWSER_FALLBACK:
-        return {"available": False, "reason": "browser_fallback not importable (Playwright missing?)"}
-    from browser_fallback import browser_status as _bf_status
-    return await _bf_status()
+        return {"available": False, "reason": "browser_fallback not importable"}
+    return await _bf_status_raw()
 
-# ── Anna's Archive — explicit browser fallback ─────────────────
+# ── Anna's Archive — three-step browser flow ────────────────────
+# Step 1: Navigate → detect state
 @app.post("/download/annas-archive/browser")
-async def download_annas_browser(req: AnnaDownloadRequest, wait: int = 120):
+async def download_annas_browser(req: AnnaDownloadRequest):
     """
-    Force browser-based download from Anna's Archive (bypasses headless).
-    Uses Playwright Chromium inside the container — all traffic via VPN.
+    Navigate to the Anna's Archive book page via persistent Chromium CDP.
+    Returns page state: captcha_visual, ddos_guard_js, countdown, download_ready, etc.
     POST body: { "md5": "...", "mirror": "..." (optional) }
-    Query param: wait=120 (seconds to wait for CAPTCHA solve)
     """
     if not HAS_BROWSER_FALLBACK:
         raise HTTPException(
             status_code=501,
-            detail="Browser fallback not available. Playwright not installed in container."
+            detail="Browser fallback not available."
         )
     mirror = req.mirror or ANNAS_MIRRORS[0]
     vpn_check()
-    result = await browser_download(req.md5, mirror=mirror, wait_for_human=wait, headless=False)
-    return result
+    return await browser_navigate(req.md5, mirror=mirror)
 
 @app.get("/download/annas-archive/{md5}/browser")
-async def download_annas_browser_md5(md5: str, mirror: str | None = None, wait: int = 120):
-    """Convenience: GET /download/annas-archive/{md5}/browser?wait=120"""
+async def download_annas_browser_md5(md5: str, mirror: str | None = None):
+    """Convenience GET for browser navigate."""
     if not HAS_BROWSER_FALLBACK:
         raise HTTPException(
             status_code=501,
-            detail="Browser fallback not available. Playwright not installed in container."
+            detail="Browser fallback not available."
         )
     m = mirror or ANNAS_MIRRORS[0]
     vpn_check()
-    result = await browser_download(md5, mirror=m, wait_for_human=wait, headless=False)
-    return result
+    return await browser_navigate(md5, mirror=m)
+
+# Step 2: Wait for CAPTCHA solve → detect page change
+@app.post("/download/annas-archive/browser/wait")
+async def download_annas_browser_wait(req: AnnaDownloadRequest, timeout: int = 120):
+    """
+    Wait for the page to change after David solves the CAPTCHA via VNC.
+    POST body: { "md5": "...", "mirror": "..." (optional) }
+    Query param: timeout=120 (seconds)
+    """
+    if not HAS_BROWSER_FALLBACK:
+        raise HTTPException(
+            status_code=501,
+            detail="Browser fallback not available."
+        )
+    mirror = req.mirror or ANNAS_MIRRORS[0]
+    vpn_check()
+    return await browser_wait_for_change(req.md5, mirror=mirror, timeout=timeout)
+
+@app.get("/download/annas-archive/{md5}/browser/wait")
+async def download_annas_browser_wait_md5(
+    md5: str, mirror: str | None = None, timeout: int = 120
+):
+    """Convenience GET for browser wait."""
+    if not HAS_BROWSER_FALLBACK:
+        raise HTTPException(
+            status_code=501,
+            detail="Browser fallback not available."
+        )
+    m = mirror or ANNAS_MIRRORS[0]
+    vpn_check()
+    return await browser_wait_for_change(md5, mirror=m, timeout=timeout)
+
+# Step 3: Extract download URL and curl file
+@app.post("/download/annas-archive/browser/extract")
+async def download_annas_browser_extract(req: AnnaDownloadRequest, timeout: int = 180):
+    """
+    Click download button, wait for token URL, curl file to /downloads.
+    POST body: { "md5": "...", "mirror": "..." (optional) }
+    Query param: timeout=180 (seconds)
+    """
+    if not HAS_BROWSER_FALLBACK:
+        raise HTTPException(
+            status_code=501,
+            detail="Browser fallback not available."
+        )
+    mirror = req.mirror or ANNAS_MIRRORS[0]
+    vpn_check()
+    return await browser_extract_download(req.md5, mirror=mirror, timeout=timeout)
+
+@app.get("/download/annas-archive/{md5}/browser/extract")
+async def download_annas_browser_extract_md5(
+    md5: str, mirror: str | None = None, timeout: int = 180
+):
+    """Convenience GET for browser extract."""
+    if not HAS_BROWSER_FALLBACK:
+        raise HTTPException(
+            status_code=501,
+            detail="Browser fallback not available."
+        )
+    m = mirror or ANNAS_MIRRORS[0]
+    vpn_check()
+    return await browser_extract_download(md5, mirror=m, timeout=timeout)
 
 # ── Torrent search — Jackett ─────────────────────────────────
 @app.get("/search/torrents")

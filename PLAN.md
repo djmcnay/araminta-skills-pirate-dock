@@ -75,3 +75,7 @@ By morning David should see:
 | 22:15 | server.py updated — 3-step API (navigate/wait/extract) | Committed ff9a8fd |
 | 22:18 | Chromium binary auto-discovery fix | Committed 2c4b3dc |
 | 22:20 | `docker compose down` + `bash scripts/build.sh --no-cache` | BUILDING in background |
+| 22:40 | Build complete, container up, VPN connected | ✓ API OK, CDP OK, Jackett OK |
+| 22:42 | Navigate to Japaneasy page (browser_navigate) | ✓ download_ready — page loaded clean, no challenge |
+| 22:45 | Extract download (browser_extract_download) | hCaptcha triggered after clicking download button |
+| 22:50 | Status left for David — VNC link waiting | Awaiting human puzzle solve: https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F |

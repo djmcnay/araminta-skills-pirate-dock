@@ -155,7 +155,7 @@ python3 scripts/test_isolation.py
 ├── scripts/
 │   ├── server.py           # FastAPI server (all endpoints)
 │   ├── test.py             # Skill test suite
-│   ├── entrypoint.sh       # Container startup
+│   ├── run.sh              # Container startup
 │   ├── requirements.txt    # Python deps
 │   ├── build.sh            # Safe build wrapper
 │   ├── pre-build-check.sh  # Disk space guardrail

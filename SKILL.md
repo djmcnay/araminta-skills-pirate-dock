@@ -14,8 +14,8 @@ A custom-built Docker container running NordVPN (South Africa, P2P), aria2 for d
 **Container name:** `pirate-dock`
 **API:** `http://localhost:9876` (published port — no `docker exec` needed)
 **Jackett UI:** `http://localhost:9118` (published port)
-**Human browser display:** `https://araminta.taild3f7b9.ts.net/pirate/` (public HTTPS via Tailscale Funnel)
-**Browser fallback:** Container-local Playwright/Chromium — launched inside `pirate-dock`; zero host CDP/browser dependency. Headed Chromium uses container display `:1`, Xpra serves it on container/host port `6081`, and Tailscale Funnel exposes it at the public HTTPS browser URL.
+**Human browser display:** `https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F` (public HTTPS via Tailscale Funnel)
+**Browser fallback:** Container-local Playwright/Chromium — launched inside `pirate-dock`; zero host CDP/browser dependency. Headed Chromium uses container display `:1`, x11vnc exports it on `localhost:5900`, websockify bridges VNC→WebSocket on `0.0.0.0:6081` and serves the noVNC HTML5 client from `/usr/share/novnc`. The `path` URL parameter ensures WebSocket traffic routes through Tailscale Funnel's `/pirate/` prefix.
 
 **Tailscale Funnel invariant:** `https://araminta.taild3f7b9.ts.net/pirate/` must proxy to `http://127.0.0.1:6081`. Check with `sudo tailscale funnel status`. Repair with `sudo tailscale funnel --bg --https=443 --set-path=/pirate 6081`. Use Funnel for browser access, and do not overwrite unrelated root routes on `https://araminta.taild3f7b9.ts.net/`.
 
@@ -30,33 +30,27 @@ cd ~/Documents/GitHub/pirate-dock
 bash scripts/build.sh
 ```
 
-**After container start:** `run.sh` auto-whitelists the Docker bridge subnet (`172.16.0.0/12`) and published ports (9876, 9118, **6081**) inside NordVPN's killswitch. This is required for the host Pi and Tailscale Funnel to reach the FastAPI/Jackett/Xpra endpoints while NordVPN is active. If you manually change ports or networking, the whitelist must match.
+**After container start:** `run.sh` auto-whitelists the Docker bridge subnet (`172.16.0.0/12`) and published ports (9876, 9118, **6081**) inside NordVPN's killswitch. This is required for the host Pi and Tailscale Funnel to reach the FastAPI/Jackett/websockify endpoints while NordVPN is active. If you manually change ports or networking, the whitelist must match.
 
 ### Browser display URL
 This is the URL Minty should send by WhatsApp when human intervention is needed:
 
-```bash
-https://araminta.taild3f7b9.ts.net/pirate/
+```
+https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F
 ```
 
-Expected Tailscale Funnel config:
+The `path=pirate%2F` parameter is critical — it tells noVNC to route its WebSocket through `/pirate/` so Tailscale Funnel can proxy it correctly. Without it, noVNC connects to the root WebSocket path and Funnel drops it.
 
-```bash
-sudo tailscale funnel status
-# https://araminta.taild3f7b9.ts.net (Funnel on)
-# |-- /pirate proxy http://127.0.0.1:6081
+### noVNC display stack (inside container)
+When automation hits a visual challenge, `browser_fallback.py` launches Chromium in headed mode on container display `:1`. `run.sh` starts the full display stack:
+
+```
+Xvfb :1              → virtual framebuffer (1280x800x24)
+x11vnc -display :1   → exports display as VNC on localhost:5900
+websockify :6081 :5900 --web=/usr/share/novnc  → bridges VNC→WebSocket, serves noVNC HTML
 ```
 
-If it points anywhere else, repair it:
-
-```bash
-sudo tailscale funnel --bg --https=443 --set-path=/pirate 6081
-```
-
-### Xpra display (inside container)
-When automation hits a visual challenge, `browser_fallback.py` launches Chromium in headed mode on container display `:1`. `run.sh` starts `Xvfb :1` and `xpra shadow :1 --bind-tcp=0.0.0.0:6081 --html=on`, so the browser is visible through the Browser URL above.
-
-Do not move the browser to the host. The browser must stay inside the container so its network traffic stays inside NordVPN while the host Pi remains off the VPN.
+The user connects through `https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F` → Tailscale Funnel strips `/pirate/` prefix → reaches websockify on `:6081` → bridges to x11vnc on `:5900` → displays Xvfb `:1` with Chromium visible.
 
 ### Check status
 ```bash
@@ -210,7 +204,7 @@ Always provide:
 4. Use the working mirror `https://annas-archive.gl` (the `.li` mirror was redirecting to parking/spam)
 5. Match the browser fingerprint to South Africa: timezone `Africa/Johannesburg`, locale `en-GB`, user-agent `Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36`
 6. **BLOCKED HERE**: AA's Downloads page now shows Z-Library mirrors, but Z-Library itself is down (503). The old "Slow Partner Server" path is gone.
-7. **Human-in-the-loop fallback**. When automation fails, Chromium can launch in **headed mode** on display `:1`, visible through `https://araminta.taild3f7b9.ts.net/pirate/`. A human can interact with the browser inside the VPN tunnel to solve CAPTCHAs or click download links manually. The script then captures the resulting download URL or file.
+7. **Human-in-the-loop fallback**. When automation fails, Chromium can launch in **headed mode** on display `:1`, visible through `https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F`. A human can interact with the browser inside the VPN tunnel to solve CAPTCHAs or click download links manually. The script then captures the resulting download URL or file.
 8. File downloads via `curl --insecure --location` to `/downloads` — only works if a valid download URL is found
 
 **What does NOT work automatically (known gap):**
@@ -262,41 +256,64 @@ Always provide:
 - Anna's Archive HTML parser (2026-04-14). New UI uses `.js-aarecord-list-outer` container with flex/border-b child divs. Updated `_parse_annas_search()`.
 - Jackett startup deadlock (2026-04-14). `_start_jackett()` now checks for already-running Jackett before starting a new process; accepts HTTP 302 in addition to 200 (Jackett returns 302 for the indexers endpoint).
 - NordVPN killswitch leaked to host Pi (2026-04-17). RESOLVED. Root cause: `network_mode: host` + `CAP_NET_ADMIN` caused NordVPN's iptables killswitch to apply to the Pi's own network namespace, blocking Discord, GitHub, and all non-local Pi connectivity for ~12 hours. Fix: switched to bridge networking — NordVPN's killswitch now operates inside the container's own namespace and physically cannot affect the host. The `test_isolation.py` suite is a regression guard.
-- Docker bridge + killswitch blocked host-to-container API (2026-04-26). RESOLVED. When NordVPN connects inside the container with killswitch enabled, Docker bridge traffic (from host `172.19.0.1`) was dropped. Fix: `run.sh` now auto-whitelists the Docker bridge subnet and published ports (9876, 9118, **6081**) via `nordvpn whitelist add subnet 172.16.0.0/12`, `nordvpn whitelist add port 9876`, `nordvpn whitelist add port 9118`, `nordvpn whitelist add port 6081`. Container must restart to apply. The host can now reach the FastAPI, Jackett, and Xpra endpoints while NordVPN is active.
+- Docker bridge + killswitch blocked host-to-container API (2026-04-26). RESOLVED. When NordVPN connects inside the container with killswitch enabled, Docker bridge traffic (from host `172.19.0.1`) was dropped. Fix: `run.sh` now auto-whitelists the Docker bridge subnet and published ports (9876, 9118, **6081**) via `nordvpn whitelist add subnet 172.16.0.0/12`, `nordvpn whitelist add port 9876`, `nordvpn whitelist add port 9118`, `nordvpn whitelist add port 6081`. Container must restart to apply. The host can now reach the FastAPI, Jackett, and noVNC endpoints while NordVPN is active.
 - Playwright runtime installation failure (2026-04-26). RESOLVED. `playwright install chromium` was failing inside the container due to missing shared libraries. Fix: Dockerfile now installs `libnss3`, `xvfb`, and other Chromium system deps at image build time. Chromium is baked into the image at `/root/.cache/ms-playwright/`.
 - Anna's Archive downloads CAPTCHA — old host-CDP approach (2026-04-16). OBSOLETE. Originally used host CDP on port 9222 with xpra. Replaced by container-local Playwright (see 2026-04-26). Host CDP dependency removed.
-- **Old VNC/noVNC approach (2026-04-27).** OBSOLETE. The current display stack is `Xvfb :1` plus `xpra shadow :1` inside the container, served on port `6081` and exposed at the public HTTPS browser URL by Tailscale Funnel. Do not reintroduce noVNC ports (`5998`/`5999`) or host display `:99` for this workflow.
+- **Old VNC/noVNC approach (2026-04-27).** OBSOLETE. The old manual x11vnc+websockify hack (ports 5998/5999, host display :99) was a desperate workaround that never worked. Now superseded by the clean Dockerfile-baked stack below.
+- **xpra 3.1 HTML5 display stack (2026-04-30).** OBSOLETE. Entire xpra approach replaced with x11vnc+websockify+noVNC. See Red Herring Graveyard below for why.
 
 ## Known Issues — CURRENT
 
 - **Anna's Archive title extraction:** The parser extracts MD5 hashes correctly but titles show as "Unknown" — the title lives in a complex nested DOM structure that needs further parsing work.
 - **Jackett seeder counts via Torznab:** Consistently report 0 seeders even when torrents are alive. TPB's Torznab adapter doesn't report accurate seeder data.
 
-**SOP for Anna's Archive downloads (updated 2026-04-28):**
-1. Automation first — `browser_download()` navigates book page, identifies and clicks the best download candidate (not hardcoded "Slow Partner Server" — AA DOM changes; it scores all links by download-likeness keywords)
+**SOP for Anna's Archive downloads (updated 2026-04-30):**
+1. Automation first — `browser_download()` navigates book page, identifies and clicks the best download candidate
 2. If DDoS-Guard JS challenge: wait up to 30s for auto-redirect
-3. If DDoS-Guard visual puzzle, hCAPTCHA, login, or another manual block appears, the container takes a screenshot and returns `screenshot_b64` plus `display_url`. Minty/the calling agent may use its own vision capability outside the container, or send David the Display URL.
-4. Human-in-the-loop URL: `https://araminta.taild3f7b9.ts.net/pirate/`
-5. After challenge resolves → countdown page detected → `_handle_countdown_and_extract()` polls up to 180s:
-   - Scans all `<a>`, `<button data-clipboard-text>`, `<input>`, `<textarea>` for token URLs matching `wbsg8v.xyz` or `/d3/y/`
-   - Falls back to page redirect detection (`page.url` itself becoming the token)
-   - Extracts cookies, curls file to `/downloads` with proper headers
-6. Token URL pattern learned: `https://wbsg8v.xyz/d3/y/{unix_ts}/3000/g4/{category}/...`
+3. If visual puzzle or hCAPTCHA: container returns `screenshot_b64` + `display_url`
+4. Human-in-the-loop URL: `https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F`
+5. After challenge resolves → countdown page → `_handle_countdown_and_extract()` polls up to 180s
+6. Token URL pattern: `https://wbsg8v.xyz/d3/y/{unix_ts}/3000/g4/{category}/...`
+7. File curl'd to `/downloads` with proper cookies and headers
 
-**URL for human-in-the-loop:** `https://araminta.taild3f7b9.ts.net/pirate/`
+---
+
+## 🔴 Red Herring Graveyard
+
+**These approaches were explored and FAILED. Do NOT attempt again.**
+
+### XPRA (all approaches) — DO NOT RETRY
+- **What was tried:** xpra 3.1 (Ubuntu 22.04 apt package) in both `shadow` and `start` modes. xpra pip upgrade attempted and failed (needs full Cython build chain).
+- **How it failed:** jQuery was a symlink (→ `/usr/share/javascript/jquery/jquery.js`) which xpra's built-in HTTP server doesn't follow — returned 404. Even after resolving the symlink by installing `libjs-jquery` and copying the real file inline, xpra's application-layer WebSocket handshake threw "server error error accepting new connection" on every HTML5 client attempt. The raw WebSocket upgrade (101) worked at the TCP level, but xpra's own protocol handshake after upgrade was broken. Both shadow and start modes failed identically.
+- **Why we thought it would work:** Previous sessions had used xpra's HTML5 client successfully with CDP-based flows. The xpra documentation claims HTML5 support.
+- **Signs it was a dead end:** Same error across multiple restarts, both display modes, even after jQuery fix. No amount of configuration flags changed the outcome.
+- **What actually works:** x11vnc + websockify + noVNC (see below).
+
+### Manual x11vnc + websockify (April 27 hack) — DO NOT RETRY
+- **What was tried:** Manually launching x11vnc and websockify from inside the container without Dockerfile integration, using port 5901 and noVNC's `vnc.html`.
+- **How it failed:** `vnc.html` doesn't handle path-based WebSocket routing (needs `vnc_lite.html`). Port 5901 wasn't whitelisted in NordVPN killswitch. No persistence on rebuild.
+- **What actually works:** `vnc_lite.html?path=pirate%2F` with everything Dockerfile-baked.
+
+### Host CDP / browser on host — DO NOT RETRY
+- **What was tried:** Running Chromium on the host Pi with CDP on port 9222, routing through container VPN.
+- **How it failed:** Traffic leaked outside VPN. Host ISP DNS filtering blocks Anna's Archive. Violates the "all naughty traffic inside container" principle.
 
 ---
 
 ## Architecture Principles (never violate)
 
-### Lessons learned (2026-04-27)
-**Do not put LLM/vision providers or API keys inside container tools.** The container cannot import agent capabilities, and it should not call OpenRouter/OpenAI/Gemini/etc. directly. Correct boundary: `browser_fallback.py` returns screenshots and the live display URL; Minty/the calling agent decides whether to use its own vision capability or send David the Xpra link. Keep container dependencies minimal and keep credentials out of this repo/container unless they are required for VPN/indexer operation.
+### Lessons learned (2026-04-30)
+**Display stack:** The canonical browser display is `Xvfb :1 → x11vnc :5900 → websockify :6081 → noVNC`. xpra 3.1 is broken for HTML5 WebSocket — see Red Herring Graveyard. The `path=pirate%2F` URL parameter is MANDATORY for Funnel routing.
+
+**Self-contained images:** Docker images must contain real files, not symlinks to files outside their document root. xpra's jquery.js symlink was the original red herring that wasted hours.
+
+**Do not put LLM/vision providers or API keys inside container tools.** The container cannot import agent capabilities, and it should not call OpenRouter/OpenAI/Gemini/etc. directly. Correct boundary: `browser_fallback.py` returns screenshots and the live display URL; Minty/the calling agent decides whether to use its own vision capability or send David the noVNC link.
 
 1. **All VPN traffic originates from INSIDE the container.** Never install/run NordVPN on the host Pi.
 2. **Container is disposable:** `docker compose down && up` should restore everything.
-3. **Host-to-container ports:** API and Jackett stay localhost-only (`127.0.0.1:9876`, `127.0.0.1:9118`). Xpra display is published as host port `6081` because Tailscale Funnel proxies it to the Browser URL.
+3. **Host-to-container ports:** API and Jackett stay localhost-only (`127.0.0.1:9876`, `127.0.0.1:9118`). noVNC/websockify display is published as host port `6081` because Tailscale Funnel proxies it to the Browser URL.
 4. **Auto-whitelist Docker bridge subnet** in NordVPN on startup so killswitch doesn't block host access.
-5. **If you need to interact with the browser from within the VPN tunnel, use the Xpra URL** (`https://araminta.taild3f7b9.ts.net/pirate/`) — never run a browser on the host and route through the container.
+5. **If you need to interact with the browser from within the VPN tunnel, use the noVNC URL** (`https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F`) — never run a browser on the host and route through the container.
 
 ---
 
@@ -309,7 +326,8 @@ Always provide:
 - Image is ~1.5 GB with Playwright + Chromium baked in (was ~400 MB before browser fallback)
 - VPN kill switch blocks non-VPN traffic INSIDE the container — this is correct and desired. Host networking is unaffected.
 - Token is 64 chars, stored in `.env` and `scripts/token.txt` — never commit `token.txt` to git
-- **Browser stack runs INSIDE the container** via Playwright; no host CDP or xpra required for the AA flow
-- **Network mode** is bridge (NOT host) — ports 9876 and 9118 published to `127.0.0.1` only
+- **Browser stack runs INSIDE the container** via Playwright; no host CDP or noVNC server required
+- **Network mode** is bridge (NOT host) — ports 9876 and 9118 published to `127.0.0.1` only, port 6081 published to `0.0.0.0` for Tailscale Funnel
 - **DO NOT change to `network_mode: host`** — this would re-introduce the 2026-04-17 incident where NordVPN's killswitch broke all Pi connectivity
 - **Playwright requirements:** `playwright>=1.50.0` in `requirements.txt`; Dockerfile installs Chromium libs + runs `playwright install chromium`
+- **noVNC display URL:** `https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F` — the `path` parameter is mandatory

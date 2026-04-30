@@ -35,20 +35,20 @@ fi
 JACKETT_BIN="/opt/jackett/jackett"
 JACKETT_DATA="/data/jackett"
 
-# ── Display / xpra stack ────────────────────────────────────────
-# Xvfb :1    — virtual framebuffer (no physical display needed)
-# xpra       — shadows Xvfb and serves the HTML5 client on port 6081
-echo "[display] Starting Xvfb + xpra..."
+# ── Display / noVNC stack ────────────────────────────────────────
+# Xvfb :1      — virtual framebuffer (no physical display needed)
+# x11vnc       — exports Xvfb display as VNC on localhost:5900
+# websockify   — bridges VNC to WebSocket on 0.0.0.0:6081, serves noVNC HTML
+# noVNC        — HTML5 VNC client; David opens vnc_lite.html?path=pirate%2F
+echo "[display] Starting Xvfb + x11vnc + websockify..."
 export DISPLAY=:1
 Xvfb :1 -screen 0 1280x800x24 -ac +extension GLX +render -noreset &
 sleep 1
-xpra shadow :1 \
-    --bind-tcp=0.0.0.0:6081 \
-    --tcp-auth=none \
-    --html=on \
-    --no-daemon &
-DISPLAY_URL="${DISPLAY_URL:-https://araminta.taild3f7b9.ts.net/pirate/}"
-echo "[display] xpra HTML5 ready: $DISPLAY_URL"
+x11vnc -display :1 -forever -shared -localhost -nopw -noxdamage -noxfixes &
+sleep 1
+websockify 0.0.0.0:6081 localhost:5900 --web=/usr/share/novnc &
+DISPLAY_URL="${DISPLAY_URL:-https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F}"
+echo "[display] noVNC ready: $DISPLAY_URL"
 
 echo "━━━ Pirate Dock v3 ━━━"
 echo "API:     http://0.0.0.0:9876"

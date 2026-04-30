@@ -23,7 +23,7 @@ services:
       - XDG_DATA_HOME=/root/.local/share
       - JACKETT_PORT=9118
       - DISPLAY=:1
-      - DISPLAY_URL=https://araminta.taild3f7b9.ts.net/pirate/
+      - DISPLAY_URL=https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F
     command: ["/bin/bash", "/app/scripts/run.sh"]
     volumes:
       - ./downloads:/downloads

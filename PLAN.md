@@ -69,3 +69,9 @@ By morning David should see:
 | Time | Action | Result |
 |------|--------|--------|
 | 22:00 | Learnings documented, rebuild begins | — |
+| 22:05 | browser_fallback.py rewritten (CDP-first, 3 functions) | Committed 521fc51 |
+| 22:10 | run.sh updated — persistent Chromium + CDP | Committed c9cc1a0 |
+| 22:12 | Dockerfile cleaned — Camoufox removed | Committed c9cc1a0 |
+| 22:15 | server.py updated — 3-step API (navigate/wait/extract) | Committed ff9a8fd |
+| 22:18 | Chromium binary auto-discovery fix | Committed 2c4b3dc |
+| 22:20 | `docker compose down` + `bash scripts/build.sh --no-cache` | BUILDING in background |

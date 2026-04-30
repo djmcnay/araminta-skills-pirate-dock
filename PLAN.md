@@ -1,89 +1,66 @@
-# Pirate Dock v3.2 — Display Fix Rebuild
+# Pirate Dock v3.3 — Automation Rebuild
 
-**Started:** 2026-04-30 ~09:00
-**Completed:** 2026-04-30 ~14:55
-**Session ref:** CLI, deepseek-v4-pro:cloud
-**Goal:** Rebuild container with self-contained x11vnc + noVNC + websockify display stack. Abandon xpra entirely.
-
----
-
-## Diagnosis (2026-04-30, pre-rebuild)
-
-**Original container state:**
-- Container UP 10 hours, NordVPN connected (Johannesburg, NordLynx)
-- API on :9876 working
-- Jackett: NOT RUNNING
-
-**Display stack — Frankenstein:**
-- Xvfb :1 — running ✓
-- xpra shadow :1 — ZOMBIE (crashed, `<defunct>`)
-- x11vnc on localhost:5901 — running (manually added, NOT in run.sh/Dockerfile)
-- websockify on 0.0.0.0:6081 → localhost:5901 — running (manually added, NOT in run.sh/Dockerfile)
-- noVNC served at /pirate/vnc.html — loads but "Failed to connect to server"
-- Chromium — running headed on :1
-
-**Root cause: xpra 3.1 fundamentally broken on Ubuntu 22.04**
-After multiple failed attempts (jQuery path fixes, symlink resolution, libjs-jquery installation), xpra 3.1's HTML5 WebSocket handshake fails at the application layer with "error accepting new connection" despite a successful 101 Switching Protocols upgrade. This is an xpra 3.1 bug, not a configuration issue.
-
-**Decision:** Abandon xpra. Switch to x11vnc + noVNC + websockify.
+**Started:** 2026-04-30 ~22:00
+**Model:** deepseek-v4-pro:cloud
+**Goal:** Replace broken monolithic browser_fallback.py with CDP-driven control. Actually download a book.
 
 ---
 
-## Red Herring Graveyard
+## What We Learned (v3.2, 2026-04-30)
 
-These were attempted and failed before the correct solution was found. Do NOT revisit.
+### What WORKS
+- **Display stack:** Xvfb :1 → x11vnc :5900 → websockify :6081 → noVNC. Rock solid.
+- **VPN:** NordVPN South Africa, NordLynx P2P, killswitch on. Bridge networking. Docker subnet whitelisted.
+- **API/Jackett:** FastAPI on :9876, Jackett on :9118. Both operational.
+- **Chromium inside container:** Playwright Chromium 1217 launches headed on :1. `--no-sandbox` required.
+- **VNC visibility:** `https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F` — David can see the browser.
 
-1. **xpra 3.1 (Ubuntu 22.04 apt)** — jQuery path mismatch (js/lib/ vs js/), then symlink resolution, then WebSocket handshake failure at application layer. Fundamentally broken for HTML5.
-2. **xpra from pip** — Requires build dependencies not available in the base NordVPN image.
-3. **Manual x11vnc + websockify in running container** — Worked for testing but was NOT baked into Dockerfile/run.sh. Would not survive rebuild.
-4. **Symlink-based fixes for jQuery** — xpra's built-in HTTP server doesn't follow symlinks.
-5. **vnc.html (standard noVNC)** — Does NOT handle the `path` parameter correctly for Tailscale Funnel routing. Must use `vnc_lite.html`.
+### What DOES NOT WORK
 
----
+1. **Camoufox headless + DDoS-Guard JS challenges.** The JS redirect never fires in headless mode. The DDoS-Guard "checking your browser" page just sits there indefinitely. Tier 1 of our fallback is dead on arrival.
 
-## Final Working Architecture
+2. **hCaptcha checkbox auto-click via Playwright/CDP.** The checkbox lives in a cross-origin `<iframe>` from `hcaptcha.com`. Playwright's `frame.wait_for_selector` can find the iframe but cannot reach *into* it to click the checkbox — same-origin policy blocks it. CDP's `Runtime.evaluate` hits the same wall. There is no programmatic way to click hCaptcha's "I am human" checkbox from outside the iframe.
 
-```
-Xvfb :1 (virtual framebuffer, 1280x800x24)
-    ↓
-x11vnc (exports :1 as VNC on localhost:5900, -localhost -shared -nopw)
-    ↓
-websockify (bridges VNC→WebSocket on 0.0.0.0:6081, serves noVNC from /usr/share/novnc)
-    ↓
-Tailscale Funnel: /pirate → :6081
-    ↓
-David opens: https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F
-```
+3. **Anna's Archive DOM has changed (2026-04).** The "Slow Partner Server" button that `browser_fallback.py` hunts for no longer exists. Z-Library mirrors return 503. The download path has shifted to different buttons/links.
 
-**Browser:** Playwright Chromium 1217 at `/root/.cache/ms-playwright/chromium-1217/chrome-linux/chrome`
-- Requires `--no-sandbox` inside Docker
-- Camoufox Firefox also available
+4. **Camoufox adds complexity without benefit.** The only advantage over plain Chromium is anti-fingerprinting, but Anna's Archive's DDoS-Guard doesn't fingerprint aggressively enough for it to matter — it uses JS challenges + hCaptcha, both of which block Camoufox and Chromium equally.
+
+### Architecture Decision
+
+**Abandon the monolithic "launch browser → find buttons → auto-click → hope" model.** The script has too many assumptions about AA's DOM baked in, and every AA change breaks it.
+
+Instead: **CDP-driven control.** Chromium launches with `--remote-debugging-port=9223`. Minty controls it step-by-step via CDP — navigate, evaluate JS to find elements, click, screenshot, detect page changes. David only touches visual hCaptcha puzzles via the VNC link.
+
+This mirrors exactly how the host browser stack works (browser-setup skill, port 9222 pattern) — proven and reliable.
 
 ---
 
-## Changes Made
+## v3.3 Rebuild Plan
 
-### Dockerfile
-- Removed: `xpra`, `libjs-jquery`, all jQuery copy/symlink hacks
-- Added: `x11vnc`, `novnc`, `websockify` to apt-get install
-- Playwright Chromium + Camoufox Firefox retained
+### Phase 1: Rewrite browser_fallback.py
+Replace 400-line monolith with three clean functions:
+- `navigate(md5)` — opens book page, returns screenshot + page state
+- `wait_for_page_change(timeout)` — polls page URL, returns when navigation happens
+- `extract_download()` — finds download links, curls file to /downloads
 
-### scripts/run.sh
-- Replaced xpra startup with: Xvfb → x11vnc → websockify
-- DISPLAY_URL points to vnc_lite.html with path=pirate%2F
-- Port 6081 exposed and whitelisted in NordVPN
+No Camoufox. No hCaptcha auto-click. No button-hunting heuristics.
 
-### docker-compose.yml
-- Updated DISPLAY_URL to vnc_lite.html variant
+### Phase 2: CDP control endpoint
+Add `GET /browser/cdp` that returns the CDP WebSocket URL so Minty can connect directly.
+Chromium launches from run.sh with `--remote-debugging-port=9223`.
 
-### SKILL.md (pirate-dock + browser-display)
-- Replaced all xpra references with x11vnc/noVNC stack
-- Added Red Herring Graveyard
-- Documented correct URL format and pitfalls
+### Phase 3: Rebuild & test
+- `docker compose down`
+- Update Dockerfile (remove Camoufox dep if clean, or keep it isolated)
+- `bash scripts/build.sh --no-cache`
+- Test: launch browser, navigate to AA, actually try to download Japaneasy
 
-### Cleanup
-- Deleted: scripts/entrypoint.sh (stale)
-- Updated: README.md
+### Phase 4: Leave status for David
+By morning David should see:
+- Container running, VPN connected
+- Browser launched on AA book page
+- Either: download complete (file in /downloads) OR VNC link with hCaptcha waiting
+- Status messages documenting every step
 
 ---
 
@@ -91,35 +68,4 @@ David opens: https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate
 
 | Time | Action | Result |
 |------|--------|--------|
-| 09:00 | Plan created | — |
-| 09:02–10:30 | Multiple xpra fix attempts | ALL FAILED (see Red Herring Graveyard) |
-| 10:30 | Manual x11vnc+websockify test in running container | ✓ Working locally + through Funnel |
-| 10:35 | Dockerfile, run.sh, docker-compose.yml rewritten | ✓ |
-| 10:36 | `bash scripts/build.sh --no-cache` | ✓ Build + container start |
-| 14:54 | Chromium launched on :1 → Wikipedia | ✓ Visible via VNC |
-| 14:55 | End-to-end verification | ✓ PASSED |
-
-### Final Verification
-- `curl http://localhost:9876/status` → connected: true, country: South Africa ✓
-- Jackett running on :9118 ✓
-- noVNC display reachable at Funnel URL ✓
-- Chromium visible on remote desktop (Wikipedia loaded) ✓
-- NordVPN killswitch ON, Docker subnet whitelisted ✓
-
----
-
-## Lessons Learned
-
-1. **xpra 3.1 is dead on Ubuntu 22.04.** Do not attempt to resurrect it.
-2. **vnc_lite.html is mandatory** for Tailscale Funnel path-based routing. Standard vnc.html silently fails.
-3. **Self-contained Docker images** — no symlinks, no host dependencies. Everything copied or installed inside.
-4. **Playwright Chromium** works perfectly as the browser inside the container — just needs `--no-sandbox`.
-5. **NordVPN whitelist** must include port 6081 and the Docker bridge subnet for the display to be reachable.
-
----
-
-## Next Steps
-
-- [ ] Anna's Archive Playwright script for automated book downloading
-- [ ] Jackett configuration and indexer setup
-- [ ] Aria2 integration for download management
+| 22:00 | Learnings documented, rebuild begins | — |

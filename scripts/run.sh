@@ -53,8 +53,9 @@ echo "[display] noVNC ready: $DISPLAY_URL"
 # ── Persistent Chromium (CDP on :9223) ─────────────────────────
 # Launches a single long-lived Chromium instance so Minty can
 # connect via CDP without spawning fresh browsers per request.
-CHROMIUM_BIN="/root/.cache/ms-playwright/chromium-1217/chrome-linux/chrome"
+# Auto-discovers the Playwright-installed Chromium binary.
 CHROME_CDP_PORT=9223
+CHROMIUM_BIN=$(find /root/.cache/ms-playwright -name chrome -type f -executable 2>/dev/null | head -1)
 if [ -x "$CHROMIUM_BIN" ]; then
     echo "[browser] Launching persistent Chromium with CDP on :${CHROME_CDP_PORT}..."
     "$CHROMIUM_BIN" \

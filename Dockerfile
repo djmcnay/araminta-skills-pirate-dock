@@ -19,15 +19,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 \
     libatspi2.0-0 libx11-6 libxext6 libxfixes3 libxrender1 \
     xvfb dbus-x11 xfonts-base x11-utils x11vnc novnc websockify \
-    libgtk-3-0 libgtk2.0-0 libdbus-glib-1-2 libxt6 \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Python deps + Playwright Chromium + Camoufox Firefox ─────
 COPY scripts/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt \
     && playwright install chromium \
-    && playwright install-deps chromium \
-    && python3 -m camoufox fetch
+    && playwright install-deps chromium
 
 # ── Jackett (multi-arch aware) ───────────────────────────────
 ARG TARGETARCH

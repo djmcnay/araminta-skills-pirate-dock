@@ -2,16 +2,17 @@
 Browser fallback for pirate-dock — CDP-driven, minimal.
 
 Architecture:
-  run.sh launches Chromium headed on :1 with --remote-debugging-port=9223.
-  This module provides three functions that Minty drives via CDP:
-    navigate(md5)  → opens book page, returns screenshot + state
-    wait_for_page_change(timeout) → polls URL, returns when page advances
-    extract_download() → finds download links, curls file to /downloads
+  run.sh launches persistent Chromium headed on :1 with --remote-debugging-port=9223.
+  This module connects to that instance via Playwright's connect_over_cdp().
+  Three public functions:
+    browser_navigate(md5)  → opens book page, returns screenshot + state
+    browser_wait_for_change(md5, timeout) → polls URL, returns when page advances
+    browser_extract_download(md5, timeout) → finds token URL, curls file to /downloads
 
-No Camoufox. No hCaptcha auto-click. No button-hunting heuristics.
+No Camoufox. No hCaptcha auto-click. No heuristic button hunting.
 Visual puzzles go to David via the display URL. Minty drives everything else.
 
-CDP endpoint: ws://127.0.0.1:9223/devtools/browser/{id}
+CDP endpoint: http://127.0.0.1:9223
 """
 
 import os
@@ -45,38 +46,39 @@ def _check_playwright() -> bool:
         return False
 
 
-async def _launch_browser(p, headless: bool = False):
-    """Launch Chromium via Playwright. Returns (browser, page)."""
-    args = [
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-blink-features=AutomationControlled",
-        "--disable-infobars",
-        "--window-size=1280,800",
-        f"--remote-debugging-port={CDP_PORT}",
-    ]
-    if not headless and not os.environ.get("DISPLAY"):
-        warnings.warn("headless=False but DISPLAY not set — browser may fail")
+async def _connect_cdp(p):
+    """Connect Playwright to the persistent Chromium via CDP.
+    Returns (browser, page) using the existing browser instance.
+    """
+    cdp_url = f"http://127.0.0.1:{CDP_PORT}"
+    browser = await p.chromium.connect_over_cdp(cdp_url)
 
-    browser = await p.chromium.launch(headless=headless, args=args)
-    context = await browser.new_context(
-        viewport={"width": 1280, "height": 800},
-        locale="en-GB",
-        timezone_id="Africa/Johannesburg",
-        user_agent=(
-            "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
-        ),
-    )
+    # Use existing default context and create a fresh tab
+    contexts = browser.contexts
+    if contexts:
+        context = contexts[0]
+    else:
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            locale="en-GB",
+            timezone_id="Africa/Johannesburg",
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+            ),
+        )
+
     page = await context.new_page()
 
-    # Stealth init
-    await page.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-        window.chrome = window.chrome || {};
-        window.chrome.runtime = {};
-    """)
+    # Close the initial about:blank tab from run.sh if possible
+    existing_pages = context.pages
+    for ep in existing_pages:
+        if ep != page:
+            try:
+                if ep.url in ("about:blank", ""):
+                    await ep.close()
+            except Exception:
+                pass
 
     return browser, page
 
@@ -121,7 +123,7 @@ async def _detect_state(page) -> dict:
     if any(x in body_lower for x in ["countdown", "please wait", "seconds"]):
         return {"state": "countdown", "title": title, "url": url}
 
-    # Download links
+    # Download links — look for token URLs and download buttons
     try:
         links_raw = await page.evaluate("""
             JSON.stringify(
@@ -159,22 +161,18 @@ def _screenshot_b64(path_str: str) -> str | None:
 async def browser_navigate(
     md5: str,
     mirror: str | None = None,
-    headless: bool = False,
 ) -> dict:
     """
-    Navigate to an Anna's Archive book page and return its state.
-
-    Launches Chromium, goes to the MD5 page, takes a screenshot,
-    detects what's on the page, returns everything the caller needs.
+    Navigate to an Anna's Archive book page using the persistent Chromium.
 
     Returns dict with:
       - status: "ok" | "error"
-      - state: one of the state strings from _detect_state
+      - state: one of "ddos_guard_js", "ddos_guard_manual", "captcha_visual",
+               "cloudflare", "countdown", "download_ready", "unknown"
       - page_url, mirror, md5
-      - screenshot_path (local path to PNG)
+      - screenshot_path (local PNG)
       - screenshot_b64 (base64-encoded PNG)
       - display_url (VNC link for human-in-the-loop)
-      - cdp_port (for CDP control)
       - download_links (if state == "download_ready")
     """
     if not _check_playwright():
@@ -195,13 +193,13 @@ async def browser_navigate(
         "mirror": mirror_base,
         "display_url": DISPLAY_URL,
         "cdp_port": CDP_PORT,
+        "method": "cdp_connect",
     }
 
     async with async_playwright() as p:
         browser = None
         try:
-            browser, page = await _launch_browser(p, headless=headless)
-            result["method"] = "playwright_chromium"
+            browser, page = await _connect_cdp(p)
 
             # Navigate
             await page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
@@ -256,17 +254,13 @@ async def browser_wait_for_change(
     md5: str,
     mirror: str | None = None,
     timeout: int = 120,
-    headless: bool = False,
 ) -> dict:
     """
     Re-navigate to the book page and wait for it to change state.
 
-    After David solves a CAPTCHA, the page will redirect/change.
-    This polls the URL until it differs from the initial page,
-    then returns the new state.
-
-    Use case: call after browser_navigate returns captcha_visual.
-    David solves via VNC, then this detects the transition.
+    After David solves a CAPTCHA via VNC, the page will redirect/change.
+    This polls the URL until it differs from the initial page or
+    download links appear.
 
     Returns same shape as browser_navigate, plus:
       - waited_seconds: how long the poll ran
@@ -285,12 +279,13 @@ async def browser_wait_for_change(
         "mirror": mirror_base,
         "display_url": DISPLAY_URL,
         "cdp_port": CDP_PORT,
+        "method": "cdp_connect",
     }
 
     async with async_playwright() as p:
         browser = None
         try:
-            browser, page = await _launch_browser(p, headless=headless)
+            browser, page = await _connect_cdp(p)
 
             await page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(2)
@@ -303,7 +298,7 @@ async def browser_wait_for_change(
                 current_url = page.url
                 if current_url != initial_url and current_url != "about:blank":
                     break
-                # Also check page content for countdown/links even if URL unchanged
+                # Check page content for countdown/links even if URL unchanged
                 state = await _detect_state(page)
                 if state["state"] in ("countdown", "download_ready"):
                     break
@@ -362,11 +357,10 @@ async def browser_extract_download(
     md5: str,
     mirror: str | None = None,
     timeout: int = 180,
-    headless: bool = False,
 ) -> dict:
     """
-    Navigate to the book page (or countdown page), wait for download
-    link to appear, extract the token URL, and curl the file to /downloads.
+    Navigate to the book page (or countdown page), click the best download
+    button, wait for token URL to appear, and curl the file to /downloads.
 
     Handles the countdown → token URL flow that Anna's Archive uses
     after CAPTCHA is solved.
@@ -390,18 +384,18 @@ async def browser_extract_download(
         "md5": md5,
         "source_url": page_url,
         "mirror": mirror_base,
+        "method": "cdp_connect",
     }
 
     async with async_playwright() as p:
         browser = None
         try:
-            browser, page = await _launch_browser(p, headless=headless)
+            browser, page = await _connect_cdp(p)
 
             await page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(3)
 
-            # ── Step 1: Click the best download button ──
-            # Look for any visible link/button that suggests "download"
+            # ── Step 1: Click the best download candidate ──
             download_keywords = [
                 "download", "slow partner", "partner server",
                 "get file", "free download", "external download",
@@ -428,12 +422,10 @@ async def browser_extract_download(
                 for i, kw in enumerate(download_keywords):
                     if kw in txt:
                         score += len(download_keywords) - i
-                # Bonus: direct file links
                 if href and any(
                     href.endswith(ext) for ext in (".epub", ".pdf", ".mobi", ".zip")
                 ):
                     score += 10
-                # Bonus: token URL patterns
                 if "wbsg8v" in href or "/d3/y/" in href:
                     score += 100
                 if score:
@@ -441,7 +433,6 @@ async def browser_extract_download(
             scored.sort(reverse=True, key=lambda x: x[0])
 
             if scored:
-                # Click the best candidate
                 for _, link in scored:
                     try:
                         await link.click(timeout=5000)
@@ -463,7 +454,7 @@ async def browser_extract_download(
                     token_url = current
                     break
 
-                # Check for token URL in DOM
+                # Check DOM for token URL
                 try:
                     found_raw = await page.evaluate("""
                         JSON.stringify(
@@ -486,11 +477,10 @@ async def browser_extract_download(
                 except Exception:
                     pass
 
-                # Check if download links appeared
+                # Check _detect_state for download links
                 state = await _detect_state(page)
                 if state.get("download_links"):
                     dl_links = state["download_links"]
-                    # Prefer token URLs
                     for dl in dl_links:
                         u = dl.get("url", "")
                         if "wbsg8v" in u or "/d3/y/" in u:
@@ -502,7 +492,6 @@ async def browser_extract_download(
                         break
 
             if not token_url:
-                # Last-ditch: screenshot for diagnosis
                 screenshot_path = DOWNLOAD_DIR / f"stuck_{md5}.png"
                 await page.screenshot(path=str(screenshot_path))
                 return {
@@ -540,7 +529,7 @@ async def browser_extract_download(
 
             if proc.returncode == 0 and output_path.exists():
                 file_size = output_path.stat().st_size
-                if file_size > 1024:  # More than 1KB — real file
+                if file_size > 1024:
                     return {
                         **result,
                         "status": "success",
@@ -571,27 +560,24 @@ async def browser_extract_download(
 # ── Status check ─────────────────────────────────────────────────
 
 async def browser_status() -> dict:
-    """Check if Playwright is available."""
+    """Check if persistent Chromium CDP is reachable."""
     result = {
         "display_url": DISPLAY_URL,
         "cdp_port": CDP_PORT,
     }
-    if not _check_playwright():
-        return {**result, "available": False, "reason": "playwright not installed"}
+    # First check if CDP endpoint is alive directly
+    import httpx
     try:
-        from playwright.async_api import async_playwright
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox"],
-            )
-            await browser.close()
+        r = httpx.get(f"http://127.0.0.1:{CDP_PORT}/json/version", timeout=3)
+        if r.status_code == 200:
             return {
                 **result,
                 "available": True,
-                "type": "local_chromium",
-                "via": "container",
+                "type": "persistent_chromium",
+                "via": "cdp",
+                "browser": r.json().get("Browser", "unknown"),
             }
-    except Exception as e:
-        return {**result, "available": False, "reason": str(e)}
+    except Exception:
+        pass
+
+    return {**result, "available": False, "reason": "CDP not reachable"}

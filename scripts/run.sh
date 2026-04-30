@@ -50,9 +50,39 @@ websockify 0.0.0.0:6081 localhost:5900 --web=/usr/share/novnc &
 DISPLAY_URL="${DISPLAY_URL:-https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F}"
 echo "[display] noVNC ready: $DISPLAY_URL"
 
-echo "━━━ Pirate Dock v3 ━━━"
+# ── Persistent Chromium (CDP on :9223) ─────────────────────────
+# Launches a single long-lived Chromium instance so Minty can
+# connect via CDP without spawning fresh browsers per request.
+CHROMIUM_BIN="/root/.cache/ms-playwright/chromium-1217/chrome-linux/chrome"
+CHROME_CDP_PORT=9223
+if [ -x "$CHROMIUM_BIN" ]; then
+    echo "[browser] Launching persistent Chromium with CDP on :${CHROME_CDP_PORT}..."
+    "$CHROMIUM_BIN" \
+        --no-sandbox --disable-gpu --disable-dev-shm-usage \
+        --disable-blink-features=AutomationControlled \
+        --window-size=1280,800 \
+        --remote-debugging-port=${CHROME_CDP_PORT} \
+        --remote-debugging-address=0.0.0.0 \
+        --no-first-run --disable-default-apps \
+        --disable-popup-blocking --disable-translate \
+        "about:blank" &
+    # Wait for CDP to be reachable
+    for i in $(seq 1 10); do
+        if curl -sf "http://127.0.0.1:${CHROME_CDP_PORT}/json/version" >/dev/null 2>&1; then
+            echo "[browser] Chromium CDP ready after ${i}s."
+            break
+        fi
+        sleep 1
+        [ "$i" -eq 10 ] && echo "[browser] WARNING: CDP not ready after 10s"
+    done
+else
+    echo "[browser] WARNING: Chromium binary not found at $CHROMIUM_BIN"
+fi
+
+echo "━━━ Pirate Dock v3.3 ━━━"
 echo "API:     http://0.0.0.0:9876"
 echo "Jackett: http://0.0.0.0:${JACKETT_PORT}"
+echo "CDP:     http://0.0.0.0:${CHROME_CDP_PORT}"
 echo "Display: $DISPLAY_URL"
 
 # ── Wait for NordVPN daemon (started by s6 /init) ─────────────

@@ -266,6 +266,7 @@ Always provide:
 
 - **Anna's Archive title extraction:** The parser extracts MD5 hashes correctly but titles show as "Unknown" — the title lives in a complex nested DOM structure that needs further parsing work.
 - **Jackett seeder counts via Torznab:** Consistently report 0 seeders even when torrents are alive. TPB's Torznab adapter doesn't report accurate seeder data.
+- **Persistent Chromium can crash silently (2026-05-01 — watchdog added):** Chromium inside the container is memory-hungry and can be OOM-killed or segfault after prolonged uptime. When this happens, the display stack (Xvfb + x11vnc + websockify) remains alive but the noVNC client shows a black screen because nothing renders to the X display. Symptoms: CDP port 9223 returns ECONNREFUSED, `chrome` process shows as `<defunct>` in `ps aux`. Fix: `run.sh` now wraps the Chromium launch in a `watchdog_chrome` function that auto-restarts it on exit.
 
 **SOP for Anna's Archive downloads (updated 2026-04-30):**
 1. Automation first — `browser_download()` navigates book page, identifies and clicks the best download candidate

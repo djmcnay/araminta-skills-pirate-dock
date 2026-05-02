@@ -267,6 +267,7 @@ Always provide:
 - **Anna's Archive title extraction:** The parser extracts MD5 hashes correctly but titles show as "Unknown" — the title lives in a complex nested DOM structure that needs further parsing work.
 - **Jackett seeder counts via Torznab:** Consistently report 0 seeders even when torrents are alive. TPB's Torznab adapter doesn't report accurate seeder data.
 - **Persistent Chromium can crash silently (2026-05-01 — watchdog added):** Chromium inside the container is memory-hungry and can be OOM-killed or segfault after prolonged uptime. When this happens, the display stack (Xvfb + x11vnc + websockify) remains alive but the noVNC client shows a black screen because nothing renders to the X display. Symptoms: CDP port 9223 returns ECONNREFUSED, `chrome` process shows as `<defunct>` in `ps aux`. Fix: `run.sh` now wraps the Chromium launch in a `watchdog_chrome` function that auto-restarts it on exit.
+- **Jackett crashes on auto-update (2026-05-02 — watchdog added):** Jackett periodically self-updates, which kills the existing process and replaces binaries. Previously this was a one-way ticket to dead — the old process would exit and nothing restarted it. Fix: `run.sh` now wraps Jackett in a `watchdog_jackett` function that auto-restarts it on ANY exit (update, crash, or OOM). `server.py` no longer tries to manage Jackett lifecycle — it only verifies it's alive at startup. The `/jackett/restart` endpoint now kills Jackett and lets the watchdog restart it cleanly.
 
 **SOP for Anna's Archive downloads (updated 2026-04-30):**
 1. Automation first — `browser_download()` navigates book page, identifies and clicks the best download candidate
@@ -276,6 +277,97 @@ Always provide:
 5. After challenge resolves → countdown page → `_handle_countdown_and_extract()` polls up to 180s
 6. Token URL pattern: `https://wbsg8v.xyz/d3/y/{unix_ts}/3000/g4/{category}/...`
 7. File curl'd to `/downloads` with proper cookies and headers
+
+---
+
+## 🛡️ Operational SOP — MUST READ BEFORE ANY BOOK REQUEST
+
+This section is the playbook for handling pirate-dock failures gracefully. Models of all strengths should follow these rules.
+
+### A) ALWAYS check container health first
+
+Before any search or download, call:
+```
+GET /status    → check "connected" (VPN) and "jackett_running"
+GET /browser/status  → check "available" (CDP/Chromium)
+```
+
+### B) API timeout / Jackett down — warm-up protocol
+
+Jackett auto-updates on container restart and can be unresponsive for 30-60s while it copies DLLs. A watchdog now auto-restarts it (2026-05-02), but there's still a warm-up window.
+
+**If `/status` returns `jackett_running: false`:**
+1. Wait 30s and retry once
+2. If still down after retry: skip torrent search entirely, go browser-only
+3. Use `/download/annas-archive/browser` for the actual download
+
+**If the API is completely unreachable (timeout/connection refused):**
+1. Wait 10s, retry once
+2. If still dead: tell David "pirate-dock API is unresponsive — container may need a restart"
+3. Do NOT proceed with the request. Do NOT scrape from the host.
+
+### C) Browser fallback flow — three steps
+
+When headless scraping fails or is blocked:
+
+```
+Step 1: POST /download/annas-archive/browser {"md5": "..."}
+         → Returns state: captcha_visual, ddos_guard_js, countdown, download_ready
+```
+
+If `captcha_visual` or `ddos_guard_manual`: send David the VNC link.
+
+```
+Step 2: POST /download/annas-archive/browser/wait {"md5": "..."}
+         → Polls the page, waits for CAPTCHA solve. Timeout 120s.
+         → Returns changed state or timeout
+```
+
+If David hasn't solved the CAPTCHA within 120s, this will timeout. That's expected. Send ONE follow-up ping then stop asking.
+
+```
+Step 3: POST /download/annas-archive/browser/extract {"md5": "..."}
+         → Clicks download, waits for token URL, curls file. Timeout 180s.
+         → Returns file_path on success
+```
+
+### D) CAPTCHA stall — the 5-minute rule
+
+When the browser flow hits a CAPTCHA:
+1. Send David the VNC link ONCE with a clear message
+2. Set a 5-minute mental timer. Do not set a cron — sessions may not last that long
+3. If David acknowledges he's solving it: poll `/download/annas-archive/browser/wait`
+4. If no response after 5 minutes: leave it. David will come back to it.
+
+Do NOT repeatedly ping. Do NOT assume the download auto-completes. The flow is asynchronous by design.
+
+### E) 🔴 ANTI-PATTERNS — never do these
+
+**DO NOT scrape Anna's Archive from the host Pi.**
+- Traffic must go through the container's NordVPN tunnel.
+- Host ISP DNS blocks AA. Host requests leak traffic outside VPN.
+
+**DO NOT use `docker exec -it pirate-dock` for ad-hoc commands.**
+- The published API (`localhost:9876`) is the only supported interface.
+- Ad-hoc execs bypass lifecycle management, VPN checks, and error handling.
+
+**DO NOT run browsers on the host and route through the container.**
+- The browser stack (Playwright + Chromium) runs INSIDE the container.
+- The noVNC URL is the only human-in-the-loop interface.
+
+**DO NOT change `network_mode` to `host`.**
+- This caused a 12-hour Pi-wide connectivity outage on 2026-04-17.
+- Bridge networking isolates NordVPN's killswitch inside the container.
+
+### F) If all else fails
+
+Tell David clearly:
+- What went wrong (specific endpoint, error message)
+- What was tried (search, headless, browser fallback)
+- What's needed (container restart, manual download, wait for Jackett)
+- The Anna's Archive page link as a final fallback: `https://annas-archive.gl/md5/{md5}`
+
+Never leave David with a silent failure.
 
 ---
 

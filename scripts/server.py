@@ -109,44 +109,23 @@ def vpn_check():
         )
 
 # ── Jackett helpers ──────────────────────────────────────────
-_jackett_proc = None
+# Jackett lifecycle is managed by run.sh watchdog (auto-restarts on exit).
+# server.py only verifies it's alive and provides API access.
 
-def _start_jackett():
-    """Start Jackett as background process (skip if already running)."""
-    global _jackett_proc
-
-    # Check if Jackett is already running (e.g. from previous container boot)
-    try:
-        r = httpx.get(f"http://127.0.0.1:{JACKETT_PORT}/api/v2.0/indexers", timeout=2)
-        if r.status_code in (200, 302):
-            return True  # Already running, no need to start
-    except Exception:
-        pass
-
-    if _jackett_proc and _jackett_proc.poll() is None:
-        return  # Already started by us
-
-    jackett_dir = DATA_DIR / "jackett"
-    jackett_dir.mkdir(parents=True, exist_ok=True)
-
-    _jackett_proc = subprocess.Popen(
-        [JACKETT_BIN, "--NoRestart", "--DataFolder", str(jackett_dir),
-         "--Port", "9118", "--ListenPublic"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        preexec_fn=os.setsid,
-    )
-
-    # Wait for Jackett to be ready
-    for i in range(30):
+def _kill_jackett() -> bool:
+    """Kill the Jackett process so watchdog restarts it. Returns True if killed."""
+    import subprocess as sp
+    r = sp.run(["pgrep", "-f", "jackett"], capture_output=True, text=True)
+    pids = r.stdout.strip().split()
+    if not pids:
+        return False
+    for pid in pids:
         try:
-            r = httpx.get(f"http://127.0.0.1:{JACKETT_PORT}/api/v2.0/indexers", timeout=2)
-            if r.status_code in (200, 302):
-                return True
+            import os as _os
+            _os.kill(int(pid), 9)
         except Exception:
             pass
-        import time; time.sleep(1)
-    return False
+    return True
 
 def _jackett_url(path: str = "") -> str:
     base = f"http://127.0.0.1:{JACKETT_PORT}"
@@ -179,16 +158,17 @@ def _local_http_alive(port: int, path: str = "/") -> bool:
 # ── App lifecycle ────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    _start_jackett()
-    # Auto-detect Jackett API key if not set
+    # Startup: verify Jackett is alive (started by run.sh watchdog).
     global JACKETT_API_KEY
     if not JACKETT_API_KEY:
         JACKETT_API_KEY = _jackett_api_key() or ""
+    import time
+    for _ in range(30):
+        if _local_http_alive(JACKETT_PORT, "/api/v2.0/indexers"):
+            break
+        time.sleep(1)
     yield
-    # Shutdown
-    if _jackett_proc and _jackett_proc.poll() is None:
-        os.killpg(os.getpgid(_jackett_proc.pid), signal.SIGTERM)
+    # Shutdown: nothing to clean up (watchdog handles Jackett)
 
 app = FastAPI(title="Pirate Dock", version="3.0", lifespan=lifespan)
 
@@ -196,10 +176,7 @@ app = FastAPI(title="Pirate Dock", version="3.0", lifespan=lifespan)
 @app.get("/status")
 async def get_status():
     s = vpn_status()
-    s["jackett_running"] = (
-        (_jackett_proc is not None and _jackett_proc.poll() is None)
-        or _local_http_alive(JACKETT_PORT, "/")
-    )
+    s["jackett_running"] = _local_http_alive(JACKETT_PORT, "/api/v1.0/server/config")
     s["jackett_port"] = JACKETT_PORT
     s["jackett_api_key_set"] = bool(JACKETT_API_KEY)
     s["display_url"] = os.getenv("DISPLAY_URL", "https://araminta.taild3f7b9.ts.net/pirate/")
@@ -756,16 +733,14 @@ async def jackett_indexers():
 
 @app.post("/jackett/restart")
 async def jackett_restart():
-    """Restart Jackett (e.g. after config changes)."""
-    global _jackett_proc
-    if _jackett_proc and _jackett_proc.poll() is None:
-        os.killpg(os.getpgid(_jackett_proc.pid), signal.SIGTERM)
+    """Restart Jackett — kill it and let watchdog auto-relaunch."""
+    killed = _kill_jackett()
+    if killed:
         import time; time.sleep(2)
-    _start_jackett()
     global JACKETT_API_KEY
     if not JACKETT_API_KEY:
         JACKETT_API_KEY = _jackett_api_key() or ""
-    return {"status": "restarted", "api_key_set": bool(JACKETT_API_KEY)}
+    return {"status": "restarted", "killed": killed, "api_key_set": bool(JACKETT_API_KEY)}
 
 # ── UFC Watch (background poller) ────────────────────────────
 # Stores watch state in memory; persists across requests within process

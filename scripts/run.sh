@@ -167,16 +167,40 @@ nordvpn whitelist add port 9223 2>/dev/null || true
     echo "[vpn] $(nordvpn status 2>&1)"
 ) &
 
-# ── Jackett ────────────────────────────────────────────────────
-echo "[jackett] Starting..."
-$JACKETT_BIN --NoRestart --DataFolder "$JACKETT_DATA" --Port "$JACKETT_PORT" --ListenPublic &
-for i in $(seq 1 15); do
-    curl -sf "http://127.0.0.1:${JACKETT_PORT}/api/v1.0/server/config" >/dev/null 2>&1 && {
-        echo "[jackett] Ready after ${i}s."
-        break
-    }
-    sleep 1
-done
+# ── Jackett watchdog (auto-restarts on crash/update) ──────────
+watchdog_jackett() {
+    local restart_count=0
+    while true; do
+        if [ "$restart_count" -gt 0 ]; then
+            echo "[jackett] Relaunching (restart #${restart_count})..."
+            sleep 5  # Cooldown — Jackett releases ports slowly
+        else
+            echo "[jackett] Starting..."
+        fi
+
+        $JACKETT_BIN --NoRestart --DataFolder "$JACKETT_DATA" \
+            --Port "$JACKETT_PORT" --ListenPublic &
+        JACKETT_PID=$!
+
+        local ready=0
+        for i in $(seq 1 30); do
+            if curl -sf "http://127.0.0.1:${JACKETT_PORT}/api/v1.0/server/config" \
+                >/dev/null 2>&1; then
+                echo "[jackett] Ready after ${i}s (PID ${JACKETT_PID})."
+                ready=1
+                break
+            fi
+            sleep 1
+        done
+        [ "$ready" -eq 0 ] && echo "[jackett] WARNING: Not ready after 30s (PID ${JACKETT_PID})"
+
+        wait $JACKETT_PID 2>/dev/null
+        restart_count=$((restart_count + 1))
+        echo "[jackett] Exited (PID ${JACKETT_PID}, restart #${restart_count}). Relaunching..."
+    done
+}
+
+watchdog_jackett &
 
 # ── FastAPI server (foreground — keeps container alive) ────────
 echo "[api] Starting FastAPI..."

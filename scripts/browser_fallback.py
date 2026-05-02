@@ -1,16 +1,13 @@
 """
-Browser fallback for pirate-dock — CDP-driven, minimal.
+Browser fallback for pirate-dock — CDP-driven, implements the full flow.
 
 Architecture:
   run.sh launches persistent Chromium headed on :1 with --remote-debugging-port=9223.
-  This module connects to that instance via Playwright's connect_over_cdp().
-  Three public functions:
-    browser_navigate(md5)  → opens book page, returns screenshot + state
-    browser_wait_for_change(md5, timeout) → polls URL, returns when page advances
-    browser_extract_download(md5, timeout) → finds token URL, curls file to /downloads
-
-No Camoufox. No hCaptcha auto-click. No heuristic button hunting.
-Visual puzzles go to David via the display URL. Minty drives everything else.
+  This module connects via Playwright's connect_over_cdp().
+  Three public functions implement the agreed workflow:
+    1. browser_navigate(md5)    → opens book page, expands External downloads, detects state
+    2. browser_wait_for_change(md5, timeout) → polls for CAPTCHA solve/page change
+    3. browser_extract_download(md5, timeout) → click slow server, handle DDoS→hCaptcha→countdown→curl
 
 CDP endpoint: http://127.0.0.1:9223
 """
@@ -19,9 +16,9 @@ import os
 import json
 import asyncio
 import base64
+import re
 from pathlib import Path
 from urllib.parse import unquote
-import warnings
 
 DOWNLOAD_DIR = Path("/downloads")
 DISPLAY_URL = os.environ.get(
@@ -38,7 +35,6 @@ ANNAS_MIRRORS = [
 
 
 def _check_playwright() -> bool:
-    """Check if Playwright is importable."""
     try:
         from playwright.async_api import async_playwright  # noqa: F401
         return True
@@ -47,13 +43,9 @@ def _check_playwright() -> bool:
 
 
 async def _connect_cdp(p):
-    """Connect Playwright to the persistent Chromium via CDP.
-    Returns (browser, page) using the existing browser instance.
-    """
     cdp_url = f"http://127.0.0.1:{CDP_PORT}"
     browser = await p.chromium.connect_over_cdp(cdp_url)
 
-    # Use existing default context and create a fresh tab
     contexts = browser.contexts
     if contexts:
         context = contexts[0]
@@ -70,7 +62,6 @@ async def _connect_cdp(p):
 
     page = await context.new_page()
 
-    # Close the initial about:blank tab from run.sh if possible
     existing_pages = context.pages
     for ep in existing_pages:
         if ep != page:
@@ -84,7 +75,11 @@ async def _connect_cdp(p):
 
 
 async def _detect_state(page) -> dict:
-    """Detect what's on the current page. Returns state dict."""
+    """Detect what's on the current page. Returns state dict.
+    
+    CRITICAL: does NOT flag filepath metadata links (.epub, .pdf in hrefs)
+    as download_ready. Only actual token URLs or action buttons count.
+    """
     try:
         title = await page.title()
     except Exception:
@@ -97,9 +92,9 @@ async def _detect_state(page) -> dict:
     except Exception:
         pass
     body_lower = body.lower()
+    title_lower = title.lower()
 
     # DDoS-Guard
-    title_lower = title.lower()
     if "ddos-guard" in title_lower or "checking your browser" in title_lower:
         if "manual check" in body_lower:
             return {"state": "ddos_guard_manual", "title": title, "url": url}
@@ -115,25 +110,38 @@ async def _detect_state(page) -> dict:
     if captcha_count > 0:
         return {"state": "captcha_visual", "title": title, "url": url}
 
+    # Check if we're on a /slow_download/ page
+    if "/slow_download/" in url:
+        # Look for "I am human" checkbox, countdown, or download token
+        if any(x in body_lower for x in ["countdown", "please wait", "seconds until"]):
+            return {"state": "countdown", "title": title, "url": url}
+        if any(x in body_lower for x in ["i am human", "i'm human", "im not a robot"]):
+            return {"state": "ddos_guard_checkbox", "title": title, "url": url}
+        return {"state": "slow_download_page", "title": title, "url": url}
+
     # Cloudflare
     if any(x in body_lower for x in ["just a moment", "verifying you are human"]):
         return {"state": "cloudflare", "title": title, "url": url}
 
-    # Countdown
-    if any(x in body_lower for x in ["countdown", "please wait", "seconds"]):
+    # Countdown / timer
+    if any(x in body_lower for x in ["countdown", "please wait", "seconds until"]):
         return {"state": "countdown", "title": title, "url": url}
 
-    # Download links — look for token URLs and download buttons
+    # Real download links — ONLY token URLs (wbsg8v, /d3/y/) or buttons
+    # that are actual action buttons, NOT filepath metadata links
     try:
         links_raw = await page.evaluate("""
             JSON.stringify(
                 Array.from(document.querySelectorAll('a[href]'))
                     .filter(a => {
                         const t = (a.textContent || '').toLowerCase();
-                        return t.includes('download') || t.includes('get file')
-                            || a.href.includes('.pdf') || a.href.includes('.epub')
-                            || a.href.includes('.mobi') || a.href.includes('.zip')
-                            || a.href.includes('wbsg8v') || a.href.includes('/d3/y/');
+                        const h = a.href || '';
+                        // Only token URLs or explicit download action buttons
+                        return h.includes('wbsg8v') 
+                            || h.includes('/d3/y/')
+                            || t.includes('slow download')
+                            || t.includes('partner server')
+                            || (t.includes('download') && !t.includes('search') && !t.includes('view in'));
                     })
                     .map(a => ({text: (a.textContent||'').trim().substring(0,100), url: a.href}))
             )
@@ -144,16 +152,114 @@ async def _detect_state(page) -> dict:
     except Exception:
         pass
 
-    return {"state": "unknown", "title": title, "url": url}
+    # Check if "External downloads" section exists (book page — needs expanding)
+    try:
+        ext_dl = await page.evaluate("""
+            (() => {
+                const els = document.querySelectorAll('a, button, div, span, h2, h3');
+                for (const el of els) {
+                    const t = (el.textContent || '').toLowerCase();
+                    if (t.includes('external download') || t.includes('download options')) {
+                        return true;
+                    }
+                }
+                return false;
+            })()
+        """)
+        if ext_dl:
+            return {"state": "book_page", "title": title, "url": url, "has_external_downloads": True}
+    except Exception:
+        pass
+
+    return {"state": "book_page", "title": title, "url": url}
 
 
 def _screenshot_b64(path_str: str) -> str | None:
-    """Read a PNG screenshot and return base64 string."""
     try:
         with open(path_str, "rb") as f:
             return base64.b64encode(f.read()).decode()
     except Exception:
         return None
+
+
+async def _click_external_downloads(page) -> bool:
+    """Find and click the External downloads expander on the book page."""
+    try:
+        # Try clicking the "show external downloads" link
+        clicked = await page.evaluate("""
+            (() => {
+                const links = document.querySelectorAll('a');
+                for (const a of links) {
+                    const t = (a.textContent || '').toLowerCase();
+                    const h = (a.href || '').toLowerCase();
+                    if (t.includes('external download') || t.includes('show external')
+                        || h.includes('#external') || h.includes('downloads')) {
+                        a.click();
+                        return 'clicked_link';
+                    }
+                }
+                const buttons = document.querySelectorAll('button, [role="button"], div[onclick]');
+                for (const b of buttons) {
+                    const t = (b.textContent || '').toLowerCase();
+                    if (t.includes('external download') || t.includes('show external')) {
+                        b.click();
+                        return 'clicked_button';
+                    }
+                }
+                return 'not_found';
+            })()
+        """)
+        if clicked != 'not_found':
+            await asyncio.sleep(3)
+            return True
+    except Exception:
+        pass
+
+    # Fallback: scroll to bottom and look for download links directly
+    try:
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await asyncio.sleep(2)
+    except Exception:
+        pass
+
+    return False
+
+
+async def _click_ddos_checkbox(page) -> bool:
+    """On a DDoS-Guard page, try clicking 'I am human' checkbox."""
+    try:
+        result = await page.evaluate("""
+            (() => {
+                // Try multiple selectors for DDoS-Guard checkbox
+                const selectors = [
+                    'input[type="checkbox"]',
+                    '.js-captcha-refresh',
+                    'button',
+                    'a',
+                ];
+                for (const sel of selectors) {
+                    const els = document.querySelectorAll(sel);
+                    for (const el of els) {
+                        const t = (el.textContent || '').toLowerCase();
+                        const v = (el.value || '').toLowerCase();
+                        const p = (el.placeholder || '').toLowerCase();
+                        if (t.includes('human') || t.includes('not robot') 
+                            || v.includes('human') || p.includes('human')
+                            || t.includes("i'm") || t.includes('i am')) {
+                            el.click();
+                            return 'clicked_ddos';
+                        }
+                    }
+                }
+                return 'not_found';
+            })()
+        """)
+        if result == 'clicked_ddos':
+            await asyncio.sleep(3)
+            return True
+    except Exception:
+        pass
+    return False
 
 
 # ── Public API ──────────────────────────────────────────────────
@@ -163,24 +269,13 @@ async def browser_navigate(
     mirror: str | None = None,
 ) -> dict:
     """
-    Navigate to an Anna's Archive book page using the persistent Chromium.
+    Navigate to an Anna's Archive book page, expand External downloads,
+    and detect the real state.
 
-    Returns dict with:
-      - status: "ok" | "error"
-      - state: one of "ddos_guard_js", "ddos_guard_manual", "captcha_visual",
-               "cloudflare", "countdown", "download_ready", "unknown"
-      - page_url, mirror, md5
-      - screenshot_path (local PNG)
-      - screenshot_b64 (base64-encoded PNG)
-      - display_url (VNC link for human-in-the-loop)
-      - download_links (if state == "download_ready")
+    Returns dict with status, state, screenshot, and context for next step.
     """
     if not _check_playwright():
-        return {
-            "status": "error",
-            "message": "Playwright not installed",
-            "md5": md5,
-        }
+        return {"status": "error", "message": "Playwright not installed", "md5": md5}
 
     from playwright.async_api import async_playwright
 
@@ -201,43 +296,49 @@ async def browser_navigate(
         try:
             browser, page = await _connect_cdp(p)
 
-            # Navigate
             await page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(3)  # Let JS challenges fire
+            await asyncio.sleep(4)
+
+            # Detect initial state
+            state = await _detect_state(page)
+
+            # If on a book page, try to expand External downloads
+            if state["state"] == "book_page":
+                expanded = await _click_external_downloads(page)
+                if expanded:
+                    await asyncio.sleep(2)
+                    state = await _detect_state(page)
 
             # Screenshot
             screenshot_path = DOWNLOAD_DIR / f"navigate_{md5}.png"
-            await page.screenshot(path=str(screenshot_path))
+            await page.screenshot(path=str(screenshot_path), full_page=True)
             result["screenshot_path"] = str(screenshot_path)
             screenshot_b64 = _screenshot_b64(str(screenshot_path))
             if screenshot_b64:
                 result["screenshot_b64"] = screenshot_b64
 
-            # Detect state
-            state = await _detect_state(page)
             result["state"] = state["state"]
             result["page_title"] = state.get("title", "")
             if state.get("download_links"):
                 result["download_links"] = state["download_links"]
+            if state.get("has_external_downloads"):
+                result["has_external_downloads"] = True
 
             result["status"] = "ok"
-            if state["state"] == "captcha_visual":
-                result["message"] = (
-                    f"hCaptcha detected. David needs to solve it at: {DISPLAY_URL}"
-                )
-            elif state["state"] == "ddos_guard_js":
-                result["message"] = (
-                    "DDoS-Guard JS challenge — waiting for auto-redirect "
-                    "(may resolve silently or escalate to manual check)"
-                )
-            elif state["state"] == "ddos_guard_manual":
-                result["message"] = (
-                    f"DDoS-Guard manual check. David needs to interact at: {DISPLAY_URL}"
-                )
-            elif state["state"] == "download_ready":
-                result["message"] = "Download links found on page."
-            else:
-                result["message"] = f"Page loaded, state: {state['state']}"
+
+            # Build human-readable message
+            state_map = {
+                "download_ready": "Download links found — ready to extract",
+                "captcha_visual": f"hCaptcha detected — David solve at {DISPLAY_URL}",
+                "ddos_guard_js": "DDoS-Guard JS challenge — waiting for auto-redirect",
+                "ddos_guard_manual": f"DDoS-Guard manual check — David interact at {DISPLAY_URL}",
+                "ddos_guard_checkbox": "'I am human' checkbox visible — auto-click possible",
+                "countdown": "Countdown timer visible — waiting for download",
+                "cloudflare": "Cloudflare challenge detected",
+                "book_page": "Book page loaded — External downloads section may need expanding",
+                "slow_download_page": "On slow download page",
+            }
+            result["message"] = state_map.get(state["state"], f"State: {state['state']}")
 
             return result
 
@@ -256,14 +357,8 @@ async def browser_wait_for_change(
     timeout: int = 120,
 ) -> dict:
     """
-    Re-navigate to the book page and wait for it to change state.
-
-    After David solves a CAPTCHA via VNC, the page will redirect/change.
-    This polls the URL until it differs from the initial page or
-    download links appear.
-
-    Returns same shape as browser_navigate, plus:
-      - waited_seconds: how long the poll ran
+    Wait for page state to change after human solves CAPTCHA via VNC.
+    Polls the page, returns new state when it changes.
     """
     if not _check_playwright():
         return {"status": "error", "message": "Playwright not installed", "md5": md5}
@@ -296,11 +391,12 @@ async def browser_wait_for_change(
             for _ in range(timeout // 2):
                 await asyncio.sleep(2)
                 current_url = page.url
+                state = await _detect_state(page)
+                
+                # Changed if URL different or state is actionable
                 if current_url != initial_url and current_url != "about:blank":
                     break
-                # Check page content for countdown/links even if URL unchanged
-                state = await _detect_state(page)
-                if state["state"] in ("countdown", "download_ready"):
+                if state["state"] in ("countdown", "download_ready", "slow_download_page"):
                     break
 
             elapsed = asyncio.get_event_loop().time() - start_time
@@ -308,7 +404,6 @@ async def browser_wait_for_change(
             result["initial_url"] = initial_url
             result["final_url"] = page.url
 
-            # Screenshot
             screenshot_path = DOWNLOAD_DIR / f"waited_{md5}.png"
             await page.screenshot(path=str(screenshot_path))
             result["screenshot_path"] = str(screenshot_path)
@@ -322,25 +417,15 @@ async def browser_wait_for_change(
             if state.get("download_links"):
                 result["download_links"] = state["download_links"]
 
-            if result["final_url"] == initial_url and state["state"] not in (
-                "countdown",
-                "download_ready",
-            ):
+            if result["final_url"] == initial_url and state["state"] in ("book_page", "unknown"):
                 result["status"] = "timeout"
-                result["message"] = (
-                    f"Page did not change after {elapsed}s. "
-                    f"David may not have solved the CAPTCHA yet, "
-                    f"or the page is stuck. Check: {DISPLAY_URL}"
-                )
-            elif state["state"] == "download_ready":
+                result["message"] = f"Page unchanged after {elapsed}s. CAPTCHA may not be solved."
+            elif state["state"] in ("download_ready", "countdown"):
                 result["status"] = "ok"
-                result["message"] = "Download links found after waiting."
-            elif state["state"] == "countdown":
-                result["status"] = "ok"
-                result["message"] = "Countdown page detected — extracting download..."
+                result["message"] = f"Page advanced to: {state['state']}"
             else:
                 result["status"] = "ok"
-                result["message"] = f"Page changed, state: {state['state']}"
+                result["message"] = f"State: {state['state']}"
 
             return result
 
@@ -356,21 +441,14 @@ async def browser_wait_for_change(
 async def browser_extract_download(
     md5: str,
     mirror: str | None = None,
-    timeout: int = 180,
+    timeout: int = 300,
 ) -> dict:
     """
-    Navigate to the book page (or countdown page), click the best download
-    button, wait for token URL to appear, and curl the file to /downloads.
-
-    Handles the countdown → token URL flow that Anna's Archive uses
-    after CAPTCHA is solved.
-
-    Returns dict with:
-      - status: "success" | "error" | "timeout"
-      - file_path: absolute path to downloaded file (on success)
-      - file_size: bytes
-      - token_url: the final download URL
-      - message: human-readable explanation
+    Full extraction flow:
+    1. Navigate to book page, expand external downloads
+    2. If download links exist → click slow partner server → DDoS-Guard
+    3. Handle DDoS checkbox → hCaptcha (send to David if visible)
+    4. Wait for countdown → token URL → curl to /downloads
     """
     if not _check_playwright():
         return {"status": "error", "message": "Playwright not installed", "md5": md5}
@@ -392,104 +470,117 @@ async def browser_extract_download(
         try:
             browser, page = await _connect_cdp(p)
 
+            # ── Phase 1: Get to the book page and expand downloads ──
             await page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(3)
+            await asyncio.sleep(4)
 
-            # ── Step 1: Click the best download candidate ──
-            download_keywords = [
-                "download", "slow partner", "partner server",
-                "get file", "free download", "external download",
-                "torrent", "pdf", "epub",
-            ]
-            all_links = await page.locator("a, button").all()
-            scored = []
-            for link in all_links:
-                try:
-                    if not await link.is_visible(timeout=1000):
-                        continue
-                except Exception:
-                    continue
-                try:
-                    txt = (await link.text_content() or "").strip().lower()
-                except Exception:
-                    txt = ""
-                href = ""
-                try:
-                    href = (await link.get_attribute("href")) or ""
-                except Exception:
-                    pass
-                score = 0
-                for i, kw in enumerate(download_keywords):
-                    if kw in txt:
-                        score += len(download_keywords) - i
-                if href and any(
-                    href.endswith(ext) for ext in (".epub", ".pdf", ".mobi", ".zip")
-                ):
-                    score += 10
-                if "wbsg8v" in href or "/d3/y/" in href:
-                    score += 100
-                if score:
-                    scored.append((score, link))
-            scored.sort(reverse=True, key=lambda x: x[0])
+            state = await _detect_state(page)
+            
+            # If book page, expand external downloads
+            if state["state"] == "book_page":
+                await _click_external_downloads(page)
+                await asyncio.sleep(3)
+                state = await _detect_state(page)
 
-            if scored:
-                for _, link in scored:
-                    try:
-                        await link.click(timeout=5000)
-                        await asyncio.sleep(3)
-                        break
-                    except Exception:
-                        continue
+            # ── Phase 2: If download links visible, click slow partner server ──
+            if state["state"] == "download_ready":
+                dl_links = state.get("download_links", [])
+                slow_found = False
+                for dl in dl_links:
+                    t = dl.get("text", "").lower()
+                    if "slow download" in t or "partner server" in t:
+                        # Find and click this specific link
+                        try:
+                            await page.evaluate(f"""
+                                (() => {{
+                                    const links = document.querySelectorAll('a');
+                                    for (const a of links) {{
+                                        const txt = (a.textContent || '').toLowerCase();
+                                        const hr = (a.href || '');
+                                        if ((txt.includes('slow download') || txt.includes('partner server'))
+                                            && hr === '{dl["url"]}') {{
+                                            a.click();
+                                            return;
+                                        }}
+                                    }}
+                                }})()
+                            """)
+                            slow_found = True
+                            await asyncio.sleep(5)
+                            break
+                        except Exception:
+                            continue
 
-            # ── Step 2: Poll for download token URL ──
+                if slow_found:
+                    # Now we should be on DDoS-Guard or countdown page
+                    state = await _detect_state(page)
+
+            # ── Phase 3: Handle DDoS-Guard checkbox ──
+            if state["state"] in ("ddos_guard_checkbox", "ddos_guard_manual", "ddos_guard_js"):
+                if state["state"] == "ddos_guard_checkbox":
+                    # Try auto-clicking "I am human"
+                    clicked = await _click_ddos_checkbox(page)
+                    if clicked:
+                        await asyncio.sleep(5)
+                        state = await _detect_state(page)
+
+            # ── Phase 4: hCaptcha — can't auto-solve, return to caller ──
+            if state["state"] == "captcha_visual":
+                screenshot_path = DOWNLOAD_DIR / f"captcha_{md5}.png"
+                await page.screenshot(path=str(screenshot_path))
+                return {
+                    **result,
+                    "status": "captcha_required",
+                    "state": "captcha_visual",
+                    "message": f"hCaptcha needs solving: {DISPLAY_URL}",
+                    "screenshot_path": str(screenshot_path),
+                    "display_url": DISPLAY_URL,
+                }
+
+            # ── Phase 5: Poll for token URL (countdown → download) ──
             token_url = None
             start_time = asyncio.get_event_loop().time()
 
             while asyncio.get_event_loop().time() - start_time < timeout:
                 await asyncio.sleep(3)
 
-                # Check page URL
-                current = page.url
-                if "wbsg8v" in current or "/d3/y/" in current:
-                    token_url = current
+                current_url = page.url
+                body_text = ""
+                try:
+                    body_text = await page.evaluate("() => document.body?.innerText || ''")
+                except Exception:
+                    pass
+
+                # Direct URL match
+                if "wbsg8v" in current_url or "/d3/y/" in current_url:
+                    token_url = current_url
                     break
 
-                # Check DOM for token URL
+                # Search DOM for token URLs
                 try:
-                    found_raw = await page.evaluate("""
+                    found = await page.evaluate("""
                         JSON.stringify(
                             Array.from(document.querySelectorAll(
                                 'a[href], button[data-clipboard-text], input[value], textarea'
                             ))
                             .map(el => el.href || el.dataset?.clipboardText
                                       || el.value || el.textContent || '')
-                            .filter(s => s.includes('wbsg8v')
-                                      || s.includes('/d3/y/')
-                                      || s.endsWith('.epub')
-                                      || s.endsWith('.pdf')
-                                      || s.endsWith('.mobi'))
+                            .filter(s => s.includes('wbsg8v') || s.includes('/d3/y/')
+                                      || (s.endsWith('.epub') && s.startsWith('http'))
+                                      || (s.endsWith('.pdf') && s.startsWith('http')))
                         )
                     """)
-                    found = json.loads(found_raw)
-                    if found:
-                        token_url = found[0]
+                    found_urls = json.loads(found)
+                    if found_urls:
+                        token_url = found_urls[0]
                         break
                 except Exception:
                     pass
 
-                # Check _detect_state for download links
-                state = await _detect_state(page)
-                if state.get("download_links"):
-                    dl_links = state["download_links"]
-                    for dl in dl_links:
-                        u = dl.get("url", "")
-                        if "wbsg8v" in u or "/d3/y/" in u:
-                            token_url = u
-                            break
-                    if not token_url:
-                        token_url = dl_links[0].get("url", "")
-                    if token_url:
-                        break
+                # Check if page has countdown text
+                if any(x in body_text.lower() for x in ["seconds until", "minutes until"]):
+                    result["message"] = "Countdown timer active — waiting..."
+                    continue
 
             if not token_url:
                 screenshot_path = DOWNLOAD_DIR / f"stuck_{md5}.png"
@@ -497,15 +588,23 @@ async def browser_extract_download(
                 return {
                     **result,
                     "status": "timeout",
-                    "message": f"No download token URL found after {timeout}s",
+                    "state": "no_token_url",
+                    "message": f"No download URL found after {timeout}s. Last URL: {page.url[:120]}",
                     "screenshot_path": str(screenshot_path),
                     "display_url": DISPLAY_URL,
                 }
 
-            # ── Step 3: curl the file ──
+            # ── Phase 6: curl the file ──
             filename = unquote(token_url.split("/")[-1].split("?")[0])
             if not filename or len(filename) < 4:
                 filename = f"anna_{md5[:8]}.epub"
+            
+            # Sanitise filename — remove colons and excessive length
+            filename = filename.replace(":", "-").replace(" ", "_")
+            if len(filename) > 120:
+                name, ext = os.path.splitext(filename)
+                filename = f"{name[:80]}{ext}"
+
             output_path = DOWNLOAD_DIR / filename
 
             cookies = await page.context.cookies()
@@ -516,9 +615,8 @@ async def browser_extract_download(
             proc = await asyncio.create_subprocess_exec(
                 "curl", "-L", "-s", "-o", str(output_path),
                 "-H", f"Cookie: {cookie_str}",
-                "-H",
-                "User-Agent: Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+                "-H", "User-Agent: Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
                 "-H", f"Referer: {page.url}",
                 "--max-time", "300",
                 token_url,
@@ -533,7 +631,8 @@ async def browser_extract_download(
                     return {
                         **result,
                         "status": "success",
-                        "message": f"Downloaded {filename} ({file_size} bytes)",
+                        "state": "downloaded",
+                        "message": f"Downloaded {filename} ({file_size:,} bytes)",
                         "file_path": str(output_path),
                         "file_size": file_size,
                         "token_url": token_url,
@@ -542,6 +641,7 @@ async def browser_extract_download(
             return {
                 **result,
                 "status": "error",
+                "state": "curl_failed",
                 "message": f"curl failed (exit {proc.returncode}): "
                 f"{stderr_bytes.decode()[:200] if stderr_bytes else 'no stderr'}",
                 "token_url": token_url,
@@ -550,6 +650,7 @@ async def browser_extract_download(
 
         except Exception as e:
             result["status"] = "error"
+            result["state"] = "exception"
             result["message"] = f"Extraction failed: {e}"
             return result
         finally:
@@ -561,11 +662,7 @@ async def browser_extract_download(
 
 async def browser_status() -> dict:
     """Check if persistent Chromium CDP is reachable."""
-    result = {
-        "display_url": DISPLAY_URL,
-        "cdp_port": CDP_PORT,
-    }
-    # First check if CDP endpoint is alive directly
+    result = {"display_url": DISPLAY_URL, "cdp_port": CDP_PORT}
     import httpx
     try:
         r = httpx.get(f"http://127.0.0.1:{CDP_PORT}/json/version", timeout=3)
@@ -579,5 +676,4 @@ async def browser_status() -> dict:
             }
     except Exception:
         pass
-
     return {**result, "available": False, "reason": "CDP not reachable"}

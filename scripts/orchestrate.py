@@ -189,19 +189,18 @@ async def orchestrate_download(
     async with async_playwright() as p:
         try:
             if resume:
-                # ── RESUME: reconnect to existing captcha/slow_download page ──
-                browser, page = await _connect_to_persistent(p, "slow_download")
+                # ── RESUME: navigate to slow_download page, poll for solve ──
+                browser, page = await _connect_to_persistent(p)
                 
-                # If page is not on slow_download, navigate there
-                if "slow_download" not in page.url:
-                    await page.goto(slow_url, wait_until="domcontentloaded", timeout=30000)
-                    await asyncio.sleep(4)
+                await page.goto(slow_url, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(4)
                 
                 result["phase"] = "resume"
                 result["current_url"] = page.url
                 
                 # Poll for page change (captcha solved → countdown → token)
-                for i in range(60):  # 120 seconds
+                last_url = page.url
+                for i in range(90):  # 180 seconds
                     await asyncio.sleep(2)
                     state = await _detect_state(page)
                     
@@ -213,17 +212,18 @@ async def orchestrate_download(
                         result["message"] = "Countdown detected, waiting for download..."
                         continue
                     elif state["state"] in ("captcha_visual", "ddos_guard_js", "ddos_guard_manual"):
-                        result["phase"] = "still_captcha"
-                        result["message"] = "Captcha still visible — David may not have solved it yet"
+                        if i < 5:
+                            result["phase"] = "still_captcha"
                         continue
                     else:
-                        # Page changed — might have token
-                        if page.url != result.get("current_url", ""):
+                        if page.url != last_url:
+                            last_url = page.url
                             result["current_url"] = page.url
-                            break
                 
                 # After poll loop, check final state
                 state = await _detect_state(page)
+                result["waited_seconds"] = (result.get("waited_seconds", 0) + 180)
+                result["current_url"] = page.url
 
             else:
                 # ── FRESH START: full flow from book page ──

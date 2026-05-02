@@ -77,8 +77,8 @@ async def _connect_cdp(p):
 async def _detect_state(page) -> dict:
     """Detect what's on the current page. Returns state dict.
     
-    CRITICAL: does NOT flag filepath metadata links (.epub, .pdf in hrefs)
-    as download_ready. Only actual token URLs or action buttons count.
+    CRITICAL: hCaptcha check comes BEFORE DDoS-Guard check, since
+    a page can have both (DDoS-Guard title + hCaptcha widget).
     """
     try:
         title = await page.title()
@@ -93,6 +93,16 @@ async def _detect_state(page) -> dict:
         pass
     body_lower = body.lower()
     title_lower = title.lower()
+
+    # hCaptcha / reCAPTCHA frames — check FIRST (page may also have DDoS-Guard title)
+    try:
+        captcha_count = await page.locator(
+            "iframe[src*='hcaptcha'], iframe[src*='recaptcha']"
+        ).count()
+    except Exception:
+        captcha_count = 0
+    if captcha_count > 0:
+        return {"state": "captcha_visual", "title": title, "url": url}
 
     # DDoS-Guard
     if "ddos-guard" in title_lower or "checking your browser" in title_lower:
@@ -482,37 +492,37 @@ async def browser_extract_download(
                 await asyncio.sleep(3)
                 state = await _detect_state(page)
 
-            # ── Phase 2: If download links visible, click slow partner server ──
+            # ── Phase 2: Click Slow Partner Server #1 ──
             if state["state"] == "download_ready":
                 dl_links = state.get("download_links", [])
-                slow_found = False
+                slow_url = None
                 for dl in dl_links:
                     t = dl.get("text", "").lower()
-                    if "slow download" in t or "partner server" in t:
-                        # Find and click this specific link
-                        try:
-                            await page.evaluate(f"""
-                                (() => {{
-                                    const links = document.querySelectorAll('a');
-                                    for (const a of links) {{
-                                        const txt = (a.textContent || '').toLowerCase();
-                                        const hr = (a.href || '');
-                                        if ((txt.includes('slow download') || txt.includes('partner server'))
-                                            && hr === '{dl["url"]}') {{
-                                            a.click();
-                                            return;
-                                        }}
-                                    }}
-                                }})()
-                            """)
-                            slow_found = True
-                            await asyncio.sleep(5)
-                            break
-                        except Exception:
-                            continue
+                    if "slow partner server" in t:
+                        slow_url = dl["url"]
+                        break
 
-                if slow_found:
-                    # Now we should be on DDoS-Guard or countdown page
+                if slow_url:
+                    # Listen for new page from popup
+                    async def _handle_popup(popup):
+                        await popup.wait_for_load_state("domcontentloaded")
+                    
+                    page.context.on("page", lambda p: asyncio.ensure_future(_handle_popup(p)))
+                    
+                    try:
+                        # Click using Playwright locator for proper popup handling
+                        await page.locator(f'a[href="{slow_url}"]').first.click()
+                    except Exception:
+                        # Fallback: navigate directly
+                        await page.goto(slow_url, wait_until="domcontentloaded", timeout=30000)
+                    
+                    await asyncio.sleep(5)
+                    
+                    # Switch to newest page if popup opened
+                    pages = page.context.pages
+                    if len(pages) > 1:
+                        page = pages[-1]
+                    
                     state = await _detect_state(page)
 
             # ── Phase 3: Handle DDoS-Guard checkbox ──

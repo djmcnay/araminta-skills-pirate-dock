@@ -35,6 +35,13 @@ try:
 except ImportError:
     HAS_BROWSER_FALLBACK = False
 
+# Orchestrated download — handles full flow with resume
+try:
+    from orchestrate import orchestrate_download
+    HAS_ORCHESTRATE = True
+except ImportError:
+    HAS_ORCHESTRATE = False
+
 # ── Config ───────────────────────────────────────────────────
 DOWNLOAD_DIR = Path("/downloads")
 DATA_DIR = Path("/data")
@@ -493,6 +500,35 @@ async def download_annas_browser(req: AnnaDownloadRequest):
     mirror = req.mirror or ANNAS_MIRRORS[0]
     vpn_check()
     return await browser_navigate(req.md5, mirror=mirror)
+
+
+# ── Orchestrated download (replaces three-step for most uses) ──
+
+class OrchestrateRequest(BaseModel):
+    md5: str
+    mirror: str | None = None
+    resume: bool = False
+
+
+@app.post("/download/annas-archive/orchestrate")
+async def download_annas_orchestrate(req: OrchestrateRequest):
+    """
+    Complete end-to-end download with resume capability.
+
+    Fresh start (resume=false): navigates book page → clicks Slow Partner #1
+      → handles DDoS-Guard → detects hCaptcha → returns captcha_required + VNC URL
+
+    Resume (resume=true): reconnects to the existing browser page on the
+      slow_download URL, polls for page change after David solves captcha,
+      waits for countdown → finds token URL → curls file → returns success
+
+    POST body: { "md5": "d4094b...", "resume": false }
+    """
+    if not HAS_ORCHESTRATE:
+        raise HTTPException(status_code=501, detail="Orchestrate module not available")
+    mirror = req.mirror or ANNAS_MIRRORS[0]
+    vpn_check()
+    return await orchestrate_download(req.md5, mirror=mirror, resume=req.resume)
 
 @app.get("/download/annas-archive/{md5}/browser")
 async def download_annas_browser_md5(md5: str, mirror: str | None = None):

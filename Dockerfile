@@ -46,6 +46,7 @@ RUN mkdir -p /app /downloads /data
 WORKDIR /app
 COPY scripts/ /app/scripts/
 RUN chmod +x /app/scripts/*.sh
+COPY scripts/orchestrate.py /app/orchestrate.py
 COPY scripts/server.py /app/server.py
 COPY scripts/browser_fallback.py /app/browser_fallback.py
 

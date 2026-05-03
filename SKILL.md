@@ -148,41 +148,54 @@ Isolation tests (test_isolation.py) cover:
 
 ## Core Workflow: Book Request
 
-When a user asks for a book (by title, Amazon link, Goodreads link, ISBN, or MD5), follow this sequence:
+When a user asks for a book (by title, Amazon link, Goodreads link, ISBN, or MD5), follow this sequence. **This is the SIMPLE COOKBOOK.** Follow it exactly — do not improvise.
 
 ### Step 1: Identify the book
-- If given a URL (Amazon, Goodreads): resolve it to get the ISBN/title
+- If given a URL (Amazon, Goodreads): resolve it to get the ISBN/title/author via web_search or web_extract
 - If given a title: use it directly
 
-### Step 2: Search both pipelines in parallel (behind NordVPN)
+### Step 2: Search Anna's Archive via CDP browser
+**Skip the Python search API entirely** — its title parser is broken. Instead, use the container browser directly:
 ```
-Anna's Archive:  GET /search/annas-archive?q=<title+author+isbn>
-Torrent:         GET /search/torrents?q=<title+author+isbn>
+browser_cdp: Target.createTarget → url: https://annas-archive.gl/search?q=<title+author+isbn>
+Wait 5 seconds for page load
 ```
 
-### Step 3: Evaluate results
-
-**A) Torrent found with seeders ≥ 2 → AUTO-DOWNLOAD**
+### Step 3: Extract all results from the search page
+The browser sees the full rendered DOM — titles, MD5s, everything. Extract them:
 ```
-POST /download/magnet {"magnet": "<best_magnet_link>"}
+browser_cdp: Runtime.evaluate → expression:
+  JSON.stringify(
+    Array.from(document.querySelectorAll('.js-aarecord-list-outer a[href*="/md5/"]'))
+      .map(a => ({
+        href: a.getAttribute('href'),
+        text: a.closest('.flex')?.textContent?.trim()?.substring(0, 200)
+      }))
+  )
 ```
-Report: title, size, seeders. The file will land in `/downloads` inside the container.
+This returns MD5 hashes with visible filenames and metadata. **Match the correct book by scanning the text fields** against your known title/author. Pick the matching MD5. This is easy — even a simple model can do it because the text is right there in the output.
 
-**B) No torrent with seeders → SEND ANNA'S ARCHIVE LINK**
-- Report what was found: title, MD5, file size, available formats (EPUB/PDF/MOBI)
-- Provide the Anna's Archive page link: `https://annas-archive.gl/md5/{md5}`
-- List the mirror links (`.gl`, `.pk`, `.gd`)
-- User clicks the link and completes the download manually
+### Step 4: Download via browser extract (SINGLE-SHOT)
+```
+POST /download/annas-archive/browser/extract {"md5": "<matched_md5>"}
+--max-time 300
+```
+This handles the entire chain automatically:
+- Navigate to book page → Expand "External downloads" → Click Slow Partner Server #1
+- Handle DDoS-Guard JS challenge → Wait for countdown timer
+- Find token URL (pattern: `https://wbsg8v.xyz/d3/y/...`) → Curl file to `/downloads`
 
-**C) Nothing found on either pipeline → report that clearly**
+**Timeout:** May take up to 5 minutes. Always use `--max-time 300` or higher.
 
-### Step 4: Report results
+### Step 5: Report results
+1. **What the book is** (title, author, format, size from the result)
+2. **Download status** (success + file path, or failure + reason)
+3. **Anna's Archive page link** as fallback: `https://annas-archive.gl/md5/{md5}`
 
-Always provide:
-1. **What the book is** (title, author, format, size)
-2. **Auto-download status** (downloaded / link to click)
-3. **Anna's Archive link** (always include, as fallback)
-4. **Torrent details** (if applicable: seeders, source indexer)
+### What to do if extract fails
+- If `captcha_visual` or `ddos_guard_manual`: send David the VNC link `https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F` and tell him to solve the CAPTCHA. Then re-run extract.
+- If `timeout` or `no_token`: retry once with longer timeout.
+- If `curl_failed`: give David the Anna's Archive page link.
 
 ---
 

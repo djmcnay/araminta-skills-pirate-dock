@@ -48,6 +48,33 @@ def age_str(t):
     return f"{int(d // 86400)}d ago"
 
 
+RPC_SECRET = "piratedockrpc"
+
+def aria2_rpc_tellactive():
+    """Query aria2 RPC ports 6800-6849 inside the container (ports unpublished)."""
+    probe = """import json, urllib.request
+jobs = []
+for port in range(6800, 6810):
+    try:
+        body = json.dumps({'jsonrpc': '2.0', 'id': 's', 'method': 'aria2.tellActive',
+            'params': ['token:piratedockrpc']}).encode()
+        req = urllib.request.Request(f'http://127.0.0.1:{port}/jsonrpc', data=body,
+            headers={'Content-Type': 'application/json'}, method='POST')
+        d = json.loads(urllib.request.urlopen(req, timeout=1).read())
+        for j in d.get('result', []):
+            j['_port'] = port
+            jobs.append(j)
+    except Exception:
+        pass
+print(json.dumps(jobs))"""
+    r = subprocess.run(["docker", "exec", "pirate-dock", "python3", "-c", probe],
+                       capture_output=True, text=True, timeout=30)
+    try:
+        return json.loads(r.stdout)
+    except Exception:
+        return []
+
+
 def aria2_pids():
     r = subprocess.run(["docker", "exec", "pirate-dock", "sh", "-c",
                         "ps -o pid=,stat= -C aria2c 2>/dev/null || pgrep -a aria2c"],
@@ -117,6 +144,8 @@ def collect():
             rates[pid] = (b - a) / 2
     out["aria2"]["rate_bps"] = sum(rates.values())
     out["aria2"]["rates"] = rates
+    jobs = aria2_rpc_tellactive()
+    out["aria2"]["rpc_jobs"] = jobs
 
     listed = set()
     # jobs from per-job logs (picks up items whose files haven't landed yet)
@@ -155,6 +184,42 @@ def collect():
         item = {"name": p.name, "type": "dir", "size": total,
                 "state": "downloading" if ctl else "complete",
                 "activity": age_str(newest)}
+        # start-time: earliest job-log touched after this dir appeared
+        started = None
+        for lf in sorted(DOWNLOADS.glob(".aria2-*.log")):
+            if time.time() - lf.stat().st_mtime < 86400 * 7:
+                st_ = lf.stat()
+                started = datetime.fromtimestamp(st_.st_ctime).strftime("%H:%M %d")
+                break
+        item["started"] = started or "—"
+        # live RPC job data (authoritative: %, speed, peers, seeds)
+        # nameless jobs (resumed control files) get matched to unclaimed
+        # downloading items AFTER named ones — handled in a second pass below.
+        for j in out["aria2"].get("rpc_jobs", []):
+            jname = j.get("bittorrent", {}).get("info", {}).get("name", "") or ""
+            jd = j.get("dir", "")
+            _norm = lambda s: re.sub(r"[._]", " ", s).lower().strip()
+            _tok = lambda s: {t for t in re.split(r"\W+", _norm(s))
+                              if t and t not in ("the", "a", "x264", "x265", "hevc",
+                                                 "mkv", "mp4", "webrip", "bluray", "brrip")}
+            if jname and (_norm(jname) in _norm(p.name) or _norm(p.name) in _norm(jname)
+                          or jd.endswith(p.name)
+                          or len(_tok(jname) & _tok(p.name)) >= 3):
+                tc = int(j.get("totalLength", 0))
+                cc = int(j.get("completedLength", 0))
+                dl = int(j.get("downloadSpeed", 0))
+                item.update({
+                    "pct": round(cc / tc * 100, 1) if tc else None,
+                    "dl_bps": dl,
+                    "dl": "%.2f MiB/s" % (dl / 1048576) if dl else "idle",
+                    "done": human(cc) if tc else None,
+                    "total_est": human(tc) if tc else None,
+                    "peers": int(j.get("connections", 0)),
+                    "seeds": int(j.get("numSeeds", 0)) if j.get("numSeeds", "") != "" else None,
+                    "leechers": max(0, int(j.get("connections", 0)) - int(j.get("numSeeds", 0) or 0)),
+                    "eta": j.get("estimatedTime", ""),
+                })
+                break
         if item["state"] == "downloading" and pids:
             for pid in pids:
                 r = subprocess.run(
@@ -188,6 +253,26 @@ def collect():
                             if cn: item["peers"] = int(cn.group(1))
                     break
         out["items"].append(item)
+    # second pass: assign nameless RPC jobs to unclaimed downloading items
+    if out["aria2"].get("rpc_jobs"):
+        unclaimed = [it for it in out["items"]
+                     if it.get("state") == "downloading" and "pct" not in it]
+        nameless = [j for j in out["aria2"]["rpc_jobs"]
+                    if not j.get("bittorrent", {}).get("info", {}).get("name")]
+        for j in nameless:
+            if not unclaimed:
+                break
+            it = unclaimed.pop(0)
+            tc = int(j.get("totalLength", 0))
+            cc = int(j.get("completedLength", 0))
+            dl = int(j.get("downloadSpeed", 0))
+            it.update({
+                "pct": round(cc / tc * 100, 1) if tc else None,
+                "dl_bps": dl,
+                "dl": "%.2f MiB/s" % (dl / 1048576) if dl else "idle",
+                "peers": int(j.get("connections", 0)),
+                "leechers": max(0, int(j.get("connections", 0)) - int(j.get("numSeeds", 0) or 0)),
+            })
     return out
 
 
@@ -202,24 +287,26 @@ def render(d):
                                                       datetime.now().strftime("%H:%M")))
     a = d.get("aria2", {})
     if a["pids"]:
-        msg = "aria2: running (pids %s)" % ", ".join(str(x) for x in a["pids"])
-        if a["rate_bps"]:
-            msg += "   total pull: %.2f MiB/s" % (a["rate_bps"] / 1048576)
-        lines.append(msg)
+        lines.append("aria2: running (pids %s)" % ", ".join(str(x) for x in a["pids"]))
     else:
         lines.append("aria2: idle")
     lines.append("")
-    lines.append("%-42s %-12s %9s %4s %9s %7s %12s" % (
-        "ITEM", "STATE", "SIZE", "%", "DL", "PEERS", "ACTIVITY"))
-    lines.append("─" * 96)
+    lines.append("%-38s %-11s %5s %9s %11s %6s %8s %11s" % (
+        "ITEM", "STATE", "%", "SIZE", "DL", "SEEDS", "LEECH", "STARTED"))
+    lines.append("─" * 108)
     for it in d["items"]:
-        lines.append("%-42s %-12s %9s %4s %9s %7s %12s" % (
-            it["name"][:40], it.get("state", "?")[:12], human(it.get("size", 0)),
-            str(it.get("pct", "—")), it.get("dl", "—"), str(it.get("peers", "—")),
-            it.get("activity", "—")))
+        started = it.get("started", "—")
+        lines.append("%-38s %-11s %5s %9s %11s %6s %8s %11s" % (
+            it["name"][:36], it.get("state", "?")[:11],
+            str(it.get("pct", "—")) if it.get("pct") is not None else "—",
+            human(it.get("size", 0)),
+            it.get("dl", "—"), str(it.get("seeds", "—")) if it.get("seeds") is not None else "—",
+            str(it.get("leechers", "—")) if it.get("leechers") is not None else "—",
+            str(started)[:11]))
     lines.append("")
-    lines.append("(idle items show no speeds; per-torrent DL/peers appear while downloading)")
-    return "\n".join(lines)
+    lines.append("(complete items: — fields; live items get full data from aria2 RPC)")
+    return chr(10).join(lines)
+
 
 
 def main():

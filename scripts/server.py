@@ -15,6 +15,7 @@ import json
 import asyncio
 import subprocess
 import signal
+import re
 from pathlib import Path
 from contextlib import asynccontextmanager
 from urllib.parse import quote
@@ -51,6 +52,8 @@ STATE_DIR.mkdir(parents=True, exist_ok=True)
 JACKETT_PORT = int(os.getenv("JACKETT_PORT", "9118"))  # We pass --Port 9118 to Jackett
 JACKETT_BIN = "/opt/jackett/jackett"
 JACKETT_API_KEY = os.getenv("JACKETT_API_KEY", "")  # Set after Jackett first run
+DEFAULT_TORRENT_CATEGORIES = os.getenv("TORRENT_CATEGORIES", "2000,5000")
+DOWNLOAD_PROCESSES: dict[int, subprocess.Popen] = {}
 
 # Anna's Archive mirrors (tried in order)
 ANNAS_MIRRORS = [
@@ -80,6 +83,7 @@ class TorrentMagnetRequest(BaseModel):
 class JackettSearchRequest(BaseModel):
     query: str
     indexer: str = "all"  # "all" searches all configured indexers
+    categories: str = DEFAULT_TORRENT_CATEGORIES  # movies + TV by default
 
 class UfcWatchRequest(BaseModel):
     event: str  # e.g. "UFC 327"
@@ -136,9 +140,21 @@ def _kill_jackett() -> bool:
 
 def _jackett_url(path: str = "") -> str:
     base = f"http://127.0.0.1:{JACKETT_PORT}"
-    key_param = f"apikey={JACKETT_API_KEY}" if JACKETT_API_KEY else ""
+    if not JACKETT_API_KEY:
+        return f"{base}{path}"
     sep = "&" if "?" in path else "?"
-    return f"{base}{path}{sep}{key_param}"
+    return f"{base}{path}{sep}apikey={JACKETT_API_KEY}"
+
+def _ensure_jackett_api_key() -> None:
+    """Refresh Jackett API key from disk or raise a structured service error."""
+    global JACKETT_API_KEY
+    if not JACKETT_API_KEY:
+        JACKETT_API_KEY = _jackett_api_key() or ""
+    if not JACKETT_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Jackett API key not available. Open Jackett once or set JACKETT_API_KEY.",
+        )
 
 def _jackett_api_key() -> str | None:
     """Get Jackett API key from its config file."""
@@ -606,23 +622,47 @@ async def download_annas_browser_extract_md5(
 
 # ── Torrent search — Jackett ─────────────────────────────────
 @app.get("/search/torrents")
-async def search_torrents_get(q: str, indexer: str = "all"):
-    return await _search_jackett(q, indexer)
+async def search_torrents_get(
+    q: str,
+    indexer: str = "all",
+    categories: str = DEFAULT_TORRENT_CATEGORIES,
+    cat: str | None = None,
+):
+    return await _search_jackett(q, indexer, cat or categories)
 
 @app.post("/search/torrents")
 async def search_torrents_post(req: JackettSearchRequest):
-    return await _search_jackett(req.query, req.indexer)
+    return await _search_jackett(req.query, req.indexer, req.categories)
 
-async def _search_jackett(query: str, indexer: str = "all"):
+def _validate_torrent_categories(categories: str) -> str:
+    """Allow Torznab category lists such as 2000 or 2000,5000."""
+    categories = categories.strip()
+    if not re.fullmatch(r"\d+(,\d+)*", categories):
+        raise HTTPException(
+            status_code=400,
+            detail="categories must be a comma-separated list of numeric Torznab category IDs",
+        )
+    return categories
+
+async def _search_jackett(query: str, indexer: str = "all", categories: str = DEFAULT_TORRENT_CATEGORIES):
     """Search torrents via Jackett Torznab API."""
+    vpn_check()
+    _ensure_jackett_api_key()
+    categories = _validate_torrent_categories(categories)
+
     url = _jackett_url(
         f"/api/v2.0/indexers/{indexer}/results/torznab/api"
-        f"?t=search&cat=2000&q={quote(query)}"
+        f"?t=search&cat={categories}&q={quote(query)}"
     )
 
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=60, follow_redirects=False) as client:
             resp = await client.get(url)
+            if resp.status_code in (301, 302, 303, 307, 308):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Jackett redirected instead of returning API data; check JACKETT_API_KEY",
+                )
             if resp.status_code != 200:
                 raise HTTPException(
                     status_code=502,
@@ -633,6 +673,7 @@ async def _search_jackett(query: str, indexer: str = "all"):
             return {
                 "query": query,
                 "indexer": indexer,
+                "categories": categories,
                 "results": results[:20],
                 "count": len(results),
             }
@@ -651,35 +692,54 @@ def _parse_torznab(xml_text: str) -> list:
     soup = BeautifulSoup(xml_text, "lxml-xml")
     results = []
 
+    def text_value(item, tag: str, default: str = "") -> str:
+        node = item.select_one(tag)
+        return node.get_text(strip=True) if node else default
+
+    def int_value(value: str | None) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
     for item in soup.select("item"):
-        title = item.select_one("title")
-        link = item.select_one("link")
-        size = item.select_one("size")
-        seeders = item.select_one("seeders")
-        peers = item.select_one("peers")
-        source = item.select_one("source") or item.select_one("jackettindexer")
+        attrs = {
+            attr.get("name", "").lower(): attr.get("value", "")
+            for attr in item.find_all(lambda tag: tag.name and tag.name.endswith("attr"))
+            if attr.get("name")
+        }
 
         magnet = ""
-        for attr in item.select("enclosure, link"):
-            if attr.get("type") == "application/x-bittorrent" or \
-               attr.get("url", "").startswith("magnet:"):
-                magnet = attr.get("url", "")
-                break
+        torrent_url = ""
 
-        # Also check torznab:attr for magnet
-        for attr in item.select("attr"):
-            if attr.get("name") == "magneturl":
-                magnet = attr.get("value", "")
+        if attrs.get("magneturl", "").startswith("magnet:"):
+            magnet = attrs["magneturl"]
+
+        for enclosure in item.select("enclosure"):
+            url = enclosure.get("url", "")
+            if url.startswith("magnet:") and not magnet:
+                magnet = url
+            elif enclosure.get("type") == "application/x-bittorrent" or url.endswith(".torrent"):
+                torrent_url = torrent_url or url
+
+        for link in item.select("link"):
+            link_text = link.get_text(strip=True)
+            link_url = link.get("url", "") or link_text
+            if link_url.startswith("magnet:") and not magnet:
+                magnet = link_url
                 break
+            if link_url and not torrent_url:
+                torrent_url = link_url
 
         results.append({
-            "title": title.get_text(strip=True) if title else "",
+            "title": text_value(item, "title"),
             "magnet": magnet,
-            "size": int(size.get_text()) if size else 0,
-            "seeders": int(seeders.get_text()) if seeders else 0,
-            "peers": int(peers.get_text()) if peers else 0,
-            "source": source.get_text(strip=True) if source else "",
-            "link": link.get_text(strip=True) if link else "",
+            "torrent": torrent_url,
+            "size": int_value(attrs.get("size") or text_value(item, "size")),
+            "seeders": int_value(attrs.get("seeders") or text_value(item, "seeders")),
+            "peers": int_value(attrs.get("peers") or text_value(item, "peers")),
+            "source": attrs.get("jackettindexer") or text_value(item, "source") or text_value(item, "jackettindexer"),
+            "link": text_value(item, "link"),
         })
 
     return results
@@ -698,34 +758,60 @@ async def search_ext(q: str):
     return await _search_jackett(q, "ext")
 
 # ── Torrent download via aria2 ───────────────────────────────
+def _validate_magnet_uri(magnet: str) -> str:
+    magnet = magnet.strip()
+    if not magnet.startswith("magnet:?"):
+        raise HTTPException(status_code=400, detail="magnet must start with magnet:?")
+    magnet_lower = magnet.lower()
+    if "xt=urn:btih:" not in magnet_lower and "xt=urn:btmh:" not in magnet_lower:
+        raise HTTPException(status_code=400, detail="magnet must include xt=urn:btih or xt=urn:btmh")
+    if any(ord(ch) < 32 for ch in magnet):
+        raise HTTPException(status_code=400, detail="magnet contains invalid control characters")
+    return magnet
+
+def _validate_download_name(name: str | None) -> str | None:
+    if not name:
+        return None
+    if "/" in name or "\\" in name or name in {".", ".."}:
+        raise HTTPException(status_code=400, detail="optional_name must be a filename, not a path")
+    if any(ord(ch) < 32 for ch in name):
+        raise HTTPException(status_code=400, detail="optional_name contains invalid control characters")
+    return name
+
+def _prune_download_processes() -> None:
+    for pid, proc in list(DOWNLOAD_PROCESSES.items()):
+        if proc.poll() is not None:
+            DOWNLOAD_PROCESSES.pop(pid, None)
+
 @app.post("/download/magnet")
 async def download_magnet(req: TorrentMagnetRequest):
     """Download a torrent via aria2."""
     vpn_check()
+    magnet = _validate_magnet_uri(req.magnet)
+    optional_name = _validate_download_name(req.optional_name)
 
-    name_part = f" --out '{req.optional_name}'" if req.optional_name else ""
-
-    # aria2c with sensible defaults
-    cmd = (
-        f"aria2c --seed-time=0 "
-        f"--dir=/downloads "
-        f"--summary-interval=10 "
-        f"--max-connection-per-server=4 "
-        f"--split=4 "
-        f"{name_part} "
-        f"'{req.magnet}'"
-    )
+    cmd = [
+        "aria2c",
+        "--seed-time=0",
+        "--dir=/downloads",
+        "--summary-interval=10",
+        "--max-connection-per-server=4",
+        "--split=4",
+    ]
+    if optional_name:
+        cmd.extend(["--out", optional_name])
+    cmd.append(magnet)
 
     r = subprocess.Popen(
-        cmd, shell=True,
-        stdout=subprocess.PIPE,
+        cmd,
+        stdout=subprocess.DEVNULL,
         stderr=subprocess.STDOUT,
-        text=True,
     )
+    DOWNLOAD_PROCESSES[r.pid] = r
 
     return {
         "status": "started",
-        "magnet": req.magnet[:80] + "...",
+        "magnet": magnet[:80] + "...",
         "output_dir": "/downloads",
         "pid": r.pid,
     }
@@ -734,11 +820,31 @@ async def download_magnet(req: TorrentMagnetRequest):
 @app.get("/downloads/active")
 async def active_downloads():
     """List running aria2 processes."""
+    _prune_download_processes()
     r = subprocess.run(
         ["pgrep", "-a", "aria2c"],
         capture_output=True, text=True
     )
-    return {"processes": r.stdout.strip() or "none"}
+    return {
+        "processes": r.stdout.strip() or "none",
+        "tracked_pids": sorted(DOWNLOAD_PROCESSES),
+    }
+
+@app.delete("/downloads/active/{pid}")
+async def cancel_download(pid: int):
+    """Cancel a tracked aria2 download process."""
+    _prune_download_processes()
+    proc = DOWNLOAD_PROCESSES.get(pid)
+    if not proc:
+        raise HTTPException(status_code=404, detail="download process not tracked or already finished")
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+    DOWNLOAD_PROCESSES.pop(pid, None)
+    return {"status": "cancelled", "pid": pid}
 
 @app.get("/downloads/list")
 async def list_downloads():
@@ -759,11 +865,21 @@ async def list_downloads():
 @app.get("/jackett/indexers")
 async def jackett_indexers():
     """List available Jackett indexers."""
+    _ensure_jackett_api_key()
     url = _jackett_url("/api/v2.0/indexers")
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
             resp = await client.get(url)
+            if resp.status_code in (301, 302, 303, 307, 308):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Jackett redirected instead of returning API data; check JACKETT_API_KEY",
+                )
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Jackett returned {resp.status_code}")
             return resp.json()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Jackett unavailable: {e}")
 
@@ -798,6 +914,7 @@ async def watch_ufc(req: UfcWatchRequest):
         "found": False,
         "best_torrent": None,
         "polls": 0,
+        "last_error": None,
     }
 
     # Start background poller
@@ -828,6 +945,8 @@ async def _poll_ufc(key: str, event: str, quality: str, interval: int):
     while key in _watches and not _watches[key]["found"]:
         try:
             results = await _search_jackett(f"{event}", "all")
+            if key not in _watches:
+                break
             for r in results.get("results", []):
                 title = r.get("title", "").lower()
                 if event.lower().replace(" ", "") in title.replace(" ", ""):
@@ -837,9 +956,14 @@ async def _poll_ufc(key: str, event: str, quality: str, interval: int):
                            r.get("seeders", 0) > _watches[key]["best_torrent"].get("seeders", 0):
                             _watches[key]["best_torrent"] = r
             _watches[key]["polls"] += 1
-        except Exception:
-            pass
+            _watches[key]["last_error"] = None
+        except Exception as e:
+            if key in _watches:
+                _watches[key]["polls"] += 1
+                _watches[key]["last_error"] = str(e)
 
+        if key not in _watches:
+            break
         if _watches[key]["best_torrent"] and _watches[key]["best_torrent"].get("seeders", 0) >= 2:
             _watches[key]["found"] = True
             break

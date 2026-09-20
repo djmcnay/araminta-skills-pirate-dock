@@ -113,13 +113,13 @@ echo "Display: $DISPLAY_URL"
 
 # ── Wait for NordVPN daemon (started by s6 /init) ─────────────
 echo "[vpn] Waiting for NordVPN daemon..."
-for i in $(seq 1 30); do
-    if nordvpn status 2>&1 | grep -q "Status:"; then
+for i in $(seq 1 60); do
+    if [ -S /run/nordvpn/nordvpnd.sock ] && nordvpn status 2>&1 | grep -q "Status:"; then
         echo "[vpn] Daemon ready after ${i}s."
         break
     fi
     sleep 1
-    [ "$i" -eq 30 ] && echo "[vpn] WARNING: Daemon timeout"
+    [ "$i" -eq 60 ] && echo "[vpn] WARNING: Daemon timeout; continuing with best effort"
 done
 
 # ── Configure NordVPN ─────────────────────────────────────────

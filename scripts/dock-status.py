@@ -49,9 +49,15 @@ def age_str(t):
 
 
 def aria2_pids():
-    r = subprocess.run(["docker", "exec", "pirate-dock", "pgrep", "aria2c"],
+    r = subprocess.run(["docker", "exec", "pirate-dock", "sh", "-c",
+                        "ps -o pid=,stat= -C aria2c 2>/dev/null || pgrep -a aria2c"],
                        capture_output=True, text=True, timeout=15)
-    return [int(x) for x in r.stdout.split() if x.isdigit()]
+    out = []
+    for ln in r.stdout.splitlines():
+        parts = ln.split()
+        if len(parts) >= 2 and parts[0].isdigit() and "Z" not in parts[1]:
+            out.append(int(parts[0]))
+    return out
 
 
 def proc_rchar(pid):

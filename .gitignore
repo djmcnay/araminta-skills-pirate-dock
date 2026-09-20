@@ -4,3 +4,4 @@ scripts/token.txt
 *.aria2
 downloads/
 tmp/
+__pycache__/

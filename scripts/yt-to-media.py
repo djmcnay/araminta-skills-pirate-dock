@@ -29,6 +29,10 @@ import time
 from pathlib import Path
 
 YT = "/home/djmcnay/.local/bin/yt-dlp"
+# 2026-era YouTube requires a JS runtime + remote challenge components for the
+# n-challenge; without these yt-dlp reports "This video is not available".
+YTDLP_FLAGS = ["--js-runtimes", "node:/usr/bin/node",
+               "--remote-components", "ejs:github"]
 MEDIA = Path("/home/djmcnay/Media")
 JELLYFIN = "http://localhost:8096"
 JF_AUTH = Path("/tmp/jf-auth-header.txt")
@@ -39,7 +43,7 @@ def log(*a):
 
 
 def yt_meta(url: str) -> dict:
-    r = subprocess.run([YT, "--dump-json", "--no-playlist", url],
+    r = subprocess.run([YT, *YTDLP_FLAGS, "--dump-json", "--no-playlist", url],
                        capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
         log(f"ERROR fetching metadata: {r.stderr[-400:]}")
@@ -88,14 +92,16 @@ def main():
 
     meta = yt_meta(args.url)
     title = sanitize(args.show or meta.get("title", "video"))
-    year = args.year or (meta.get("upload_date") or "")[:4]
+    # Show year: only from an explicit --year. Upload-date years would fork a
+    # TV show into per-episode folders when episodes were uploaded years apart.
+    year = args.year
     channel = meta.get("channel") or meta.get("uploader") or ""
     duration = meta.get("duration") or 0
     log(f"title:   {meta.get('title')}")
     log(f"channel: {channel} | duration: {duration // 60}m{duration % 60:02d}s")
 
     if args.list_formats:
-        subprocess.run([YT, "-F", "--no-playlist", args.url])
+        subprocess.run([YT, *YTDLP_FLAGS, "-F", "--no-playlist", args.url])
         return
 
     section = "kids" if args.kids else "shows"
@@ -135,7 +141,7 @@ def main():
     # download
     tmp_pattern = str(dest.parent / (".yt-dl-" + str(int(time.time())) + ".%(ext)s"))
     r = subprocess.run(
-        [YT,
+        [YT, *YTDLP_FLAGS,
          "-f", "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/b",
          "--merge-output-format", "mp4",
          "--no-playlist",

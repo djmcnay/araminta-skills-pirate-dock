@@ -44,7 +44,8 @@ BOOK_EXTS = {".epub", ".pdf", ".mobi", ".azw3", ".azw"}
 
 KIDS_TITLES = ("fireman sam", "bluey", "peppa", "paw patrol", "hey duggee", "bing",
                "gruffalo", "room on the broom", "stick man", "shaun the sheep",
-               "thomas", "postman pat", "paddington", "horrid henry")
+               "thomas", "postman pat", "paddington", "horrid henry",
+               "pooh", "tigger", "piglet", "heffalump", "eeyore", "hundred acre")
 EVENT_KEYWORDS = ("ufc", "wwe", "boxing", "ppv", "fight night", "prelims", "main card",
                   "formula", "f1", "nfl", "superbowl", "six nations", "wimbledon")
 

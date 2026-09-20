@@ -52,6 +52,24 @@ websockify :6081 (container) → published as host :6082 → bridges VNC→WebSo
 
 The user connects through `https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F` → Tailscale Funnel strips `/pirate/` prefix → reaches websockify on host `:6082` (container `:6081`) → bridges to x11vnc on `:5900` → displays Xvfb `:1` with Chromium visible.
 
+## Transfer to a receiving Mac
+Completed downloads move to the receiving Mac via the repo's own script:
+
+```bash
+# One-time on a fresh Mac: clone the repo (or fetch just the script)
+git clone git@github.com:djmcnay/araminta-skills-pirate-dock.git ~/Documents/GitHub/pirate-dock
+
+# Pull a finished download (resumable, size-verified):
+bash ~/Documents/GitHub/pirate-dock/scripts/pull-from-dock.sh "UFC 331"
+bash ~/Documents/GitHub/pirate-dock/scripts/pull-from-dock.sh "Fireman Sam Series 1-5"
+```
+
+- Files land in `~/Downloads/<name>/` on the Mac.
+- Resumable (`--partial`): lid-close, network drop, or Ctrl-C are harmless — re-run to resume from the byte frontier.
+- The script byte-verifies every file against the Pi before reporting DELIVERED.
+- Requires the `ssh araminta` alias (Tailscale) on the receiving machine.
+- Any Minty (Mac or Pi) can use this: the script is canonical in this repo and the SKILL.md (this file) points to it.
+
 ### Check status
 ```bash
 curl -sf http://localhost:9876/status | python3 -m json.tool

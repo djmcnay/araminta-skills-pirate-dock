@@ -79,6 +79,12 @@ class AnnaSearchRequest(BaseModel):
 class TorrentMagnetRequest(BaseModel):
     magnet: str
     optional_name: str | None = None
+    # aria2 size suffixes: 0 = unlimited, or e.g. "1M", "500K", "10M".
+    # Upload is capped by default: be a good peer while downloading, never
+    # saturate the Pi's uplink; seed-time=0 means aria2 exits on completion,
+    # so there is no post-download seeding at all.
+    upload_limit: str = "1M"
+    download_limit: str = "0"  # 0 = unlimited (downloads should be fast)
 
 class JackettSearchRequest(BaseModel):
     query: str
@@ -812,6 +818,10 @@ async def download_magnet(req: TorrentMagnetRequest):
         "--summary-interval=10",
         "--max-connection-per-server=4",
         "--split=4",
+        f"--max-upload-limit={req.upload_limit}",
+        f"--max-overall-upload-limit={req.upload_limit}",
+        f"--max-download-limit={req.download_limit}",
+        f"--max-overall-download-limit={req.download_limit}",
     ]
     if optional_name:
         cmd.extend(["--out", optional_name])

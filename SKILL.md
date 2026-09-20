@@ -64,11 +64,22 @@ bash ~/Documents/GitHub/pirate-dock/scripts/pull-from-dock.sh "UFC 331"
 bash ~/Documents/GitHub/pirate-dock/scripts/pull-from-dock.sh "Fireman Sam Series 1-5"
 ```
 
-- Files land in `~/Downloads/<name>/` on the Mac.
-- Resumable (`--partial`): lid-close, network drop, or Ctrl-C are harmless — re-run to resume from the byte frontier.
-- The script byte-verifies every file against the Pi before reporting DELIVERED.
-- Requires the `ssh araminta` alias (Tailscale) on the receiving machine.
-- Any Minty (Mac or Pi) can use this: the script is canonical in this repo and the SKILL.md (this file) points to it.
+### Promote into the Jellyfin library (Pi)
+When a download is destined for the media server, classify + install it with the
+repo's promote script (runs ON the Pi; from the Mac: `ssh araminta`):
+
+```bash
+cd ~/Documents/GitHub/pirate-dock
+python3 scripts/promote-to-media.py --list                    # dock items
+python3 scripts/promote-to-media.py "UFC 331" --dry-run       # show the plan
+python3 scripts/promote-to-media.py "UFC 331"                 # copy + verify + scan
+```
+
+- Classification: **Event** (UFC/WWE/Boxing keywords) → events; **TV** (S##E## markers or Series/Season dirs) → shows or kids (kids allowlist: Fireman Sam, Bluey, ...); **Movie** → movies; **Book** (.epub/.pdf) → reported only (Jellyfin doesn't serve books — deliver to Mac via pull-from-dock.sh).
+- Naming: `<Title> (<Year>) - <Label>.<ext>` for movies/events; `<Show> (<Year>)/Season NN/<Show> S##E## - <Title>.ext` for TV. Year falls back to file mtime when absent from the name.
+- **Idempotent**: promotes into an existing library folder for the same title instead of creating a twin, and skips episodes whose S##E## already exists. Re-running is always safe.
+- Sources stay in the dock's downloads (copy, not move) — deleting dock items is a separate explicit decision.
+- Byte-verifies every copy before triggering a Jellyfin library scan (`POST /Library/Refresh`).
 
 ### Check status
 ```bash

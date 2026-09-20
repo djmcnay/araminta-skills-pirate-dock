@@ -799,6 +799,18 @@ def _validate_download_name(name: str | None) -> str | None:
         raise HTTPException(status_code=400, detail="optional_name contains invalid control characters")
     return name
 
+# aria2 size-rate: plain bytes, K (KiB), M (MiB), or 0 = unlimited.
+_ARA_RATE_RE = re.compile(r"^0|[1-9][0-9]*[KM]?$")
+
+def _validate_ara_rate(value: str, what: str) -> str:
+    """aria2 --max-*-limit format: '0' (unlimited) or integer + optional K/M."""
+    if not _ARA_RATE_RE.fullmatch(value or ""):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{what} must be '0' (unlimited) or a positive integer with optional K/M suffix (e.g. 500K, 10M)",
+        )
+    return value
+
 def _prune_download_processes() -> None:
     for pid, proc in list(DOWNLOAD_PROCESSES.items()):
         if proc.poll() is not None:
@@ -810,7 +822,14 @@ async def download_magnet(req: TorrentMagnetRequest):
     vpn_check()
     magnet = _validate_magnet_uri(req.magnet)
     optional_name = _validate_download_name(req.optional_name)
+    upload_limit = _validate_ara_rate(req.upload_limit, "upload_limit")
+    download_limit = _validate_ara_rate(req.download_limit, "download_limit")
 
+    # Per-job log: aria2 diagnostics were previously lost to DEVNULL, which
+    # is why the UFC stall was invisible for 40 minutes. Each job gets its
+    # own log file; /downloads/active surfaces the paths.
+    import time as _time
+    job_log = DOWNLOAD_DIR / f".aria2-{_time.strftime('%Y%m%d-%H%M%S')}.log"
     cmd = [
         "aria2c",
         "--seed-time=0",
@@ -818,10 +837,12 @@ async def download_magnet(req: TorrentMagnetRequest):
         "--summary-interval=10",
         "--max-connection-per-server=4",
         "--split=4",
-        f"--max-upload-limit={req.upload_limit}",
-        f"--max-overall-upload-limit={req.upload_limit}",
-        f"--max-download-limit={req.download_limit}",
-        f"--max-overall-download-limit={req.download_limit}",
+        "--log", str(job_log),
+        "--log-level=notice",
+        f"--max-upload-limit={upload_limit}",
+        "--max-overall-upload-limit=" + upload_limit,
+        "--max-download-limit=" + download_limit,
+        "--max-overall-download-limit=" + download_limit,
     ]
     if optional_name:
         cmd.extend(["--out", optional_name])
@@ -839,20 +860,27 @@ async def download_magnet(req: TorrentMagnetRequest):
         "magnet": magnet[:80] + "...",
         "output_dir": "/downloads",
         "pid": r.pid,
+        "log_file": str(job_log),
+        "limits": {"upload": upload_limit, "download": download_limit},
     }
 
 # ── Download management ─────────────────────────────────────
 @app.get("/downloads/active")
 async def active_downloads():
-    """List running aria2 processes."""
+    """List running aria2 processes (with per-job log paths)."""
     _prune_download_processes()
     r = subprocess.run(
         ["pgrep", "-a", "aria2c"],
         capture_output=True, text=True
     )
+    logs = sorted(
+        {"name": p.name, "size": p.stat().st_size, "modified": p.stat().st_mtime}
+        for p in DOWNLOAD_DIR.glob(".aria2-*.log")
+    )
     return {
         "processes": r.stdout.strip() or "none",
         "tracked_pids": sorted(DOWNLOAD_PROCESSES),
+        "job_logs": logs[-5:],
     }
 
 @app.delete("/downloads/active/{pid}")

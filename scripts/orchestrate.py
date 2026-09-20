@@ -20,8 +20,9 @@ import json
 import asyncio
 import base64
 import re
+import uuid
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 DOWNLOAD_DIR = Path("/downloads")
 DISPLAY_URL = os.environ.get(
@@ -330,18 +331,22 @@ async def orchestrate_download(
                 }
 
             # ── Phase 5: Curl the file ──
-            filename = safe_download_filename(token_url, md5)
-            output_path = DOWNLOAD_DIR / filename
             # Validate MD5 before it reaches any file path
             if not re.fullmatch(r"[a-f0-9]{32}", md5):
                 return {**result, "status": "error", "state": "bad_md5",
                         "message": "md5 must be 32 hex chars"}
-            part_path = DOWNLOAD_DIR / f".part_{filename}"
-            if part_path.exists():
-                part_path.unlink()
+            filename = safe_download_filename(token_url, md5)
+            output_path = DOWNLOAD_DIR / filename
+            # Unique per-request temp file: concurrent jobs must never share a
+            # .part path (a second request would unlink the first's open file
+            # and could publish the other's incomplete data). Only this
+            # request's temp file is ever touched or cleaned.
+            part_path = DOWNLOAD_DIR / f".part_{uuid.uuid4().hex[:12]}_{filename}"
 
             cookies = await page.context.cookies()
-            origin_host = re.sub(r"^https?://", "", mirror_base).split("/")[0]
+            # Scope cookies to the ACTUAL download host (token_url), not the
+            # mirror we navigated from — they are usually different domains.
+            origin_host = urlparse(token_url).netloc.split(":")[0].lower()
             cookie_str = build_scoped_cookie_header(cookies, origin_host)
 
             proc = await asyncio.create_subprocess_exec(
@@ -371,10 +376,9 @@ async def orchestrate_download(
                         "message": "Download URL returned an HTML page (challenge/error), not the file.",
                         "token_url": token_url,
                     }
-                # Atomic publish: final name only ever holds a verified file
-                if output_path.exists():
-                    output_path.unlink()
-                part_path.rename(output_path)
+                # Atomic publish: os.replace needs no unlink window, and a
+                # failed rename leaves the previous good file untouched.
+                os.replace(part_path, output_path)
                 return {
                     **result,
                     "status": "success",

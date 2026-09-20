@@ -17,8 +17,9 @@ import json
 import asyncio
 import base64
 import re
+import uuid
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 DOWNLOAD_DIR = Path("/downloads")
 DISPLAY_URL = os.environ.get(
@@ -608,13 +609,13 @@ async def browser_extract_download(
             from orchestrate import safe_download_filename, build_scoped_cookie_header
             filename = safe_download_filename(token_url, md5)
 
-            part_path = DOWNLOAD_DIR / f".part_{filename}"
-            if part_path.exists():
-                part_path.unlink()
+            # Unique per-request temp file — never shared between jobs
+            part_path = DOWNLOAD_DIR / f".part_{uuid.uuid4().hex[:12]}_{filename}"
             output_path = DOWNLOAD_DIR / filename
 
             cookies = await page.context.cookies()
-            origin_host = re.sub(r"^https?://", "", mirror_base).split("/")[0]
+            # Scope cookies to the ACTUAL download host (token_url domain)
+            origin_host = urlparse(token_url).netloc.split(":")[0].lower()
             cookie_str = build_scoped_cookie_header(cookies, origin_host)
 
             proc = await asyncio.create_subprocess_exec(
@@ -645,9 +646,9 @@ async def browser_extract_download(
                         "message": "Download URL returned an HTML page (challenge/error), not the file.",
                         "token_url": token_url,
                     }
-                if output_path.exists():
-                    output_path.unlink()
-                part_path.rename(output_path)
+                # Atomic publish: os.replace needs no unlink window, and a
+                # failed rename leaves the previous good file untouched.
+                os.replace(part_path, output_path)
                 return {
                     **result,
                     "status": "success",
@@ -658,6 +659,7 @@ async def browser_extract_download(
                     "token_url": token_url,
                 }
 
+            # Failure path: clean up ONLY this request's temp file.
             part_path.unlink(missing_ok=True)
             return {
                 **result,

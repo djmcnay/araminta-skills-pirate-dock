@@ -874,8 +874,9 @@ async def active_downloads():
         capture_output=True, text=True
     )
     logs = sorted(
-        {"name": p.name, "size": p.stat().st_size, "modified": p.stat().st_mtime}
-        for p in DOWNLOAD_DIR.glob(".aria2-*.log")
+        ({"name": p.name, "size": p.stat().st_size, "modified": p.stat().st_mtime}
+         for p in DOWNLOAD_DIR.glob(".aria2-*.log")),
+        key=lambda x: x["name"],
     )
     return {
         "processes": r.stdout.strip() or "none",

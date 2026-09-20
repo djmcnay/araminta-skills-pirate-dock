@@ -241,8 +241,12 @@ def plan(src: Path) -> tuple[str, Path, list[tuple[Path, Path]]]:
                     re.search(rf"(?i)S{season}\bE?(\d{{1,3}})?\s*[-–]?\s*(.+)", f.stem)
                 t = clean_title(m.group(1) or m.group(2)) if m else clean_title(f.stem)
                 t = re.sub(rf"(?i)^{re.escape(show)}\s*", "", t) or t
+                # release-tag junk: 720p/1080p, DSNP/AMZN/WEBRip, codecs, group names
+                t = re.sub(r"(?i)\b(720p|1080p|2160p|webrip|web[- ]?dl|hdtv|dsnp|amzn|nf|x264|x265|hevc|aac|ddp?5?\.?[01]?|h\.?264)\b.*$", "", t)
+                t = re.sub(r"(?i)\b\d{3,4}p\b", "", t)
+                t = re.sub(r"[-\s]+$", "", t).strip()
             dest = show_dir / f"Season {season:02d}" / (
-                f"{show} S{season:02d}E{ep:02d} - {t}{f.suffix.lower()}")
+                f"{show} S{season:02d}E{ep:02d}{' - ' + t if t else ''}{f.suffix.lower()}")
             moves.append((f, dest))
         # sidecars (srt/nfo) follow the first video's target dir
         if moves:

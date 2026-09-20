@@ -46,7 +46,10 @@ Xvfb :1 -screen 0 1280x800x24 -ac +extension GLX +render -noreset &
 sleep 1
 x11vnc -display :1 -forever -shared -localhost -nopw -noxdamage -noxfixes &
 sleep 1
-websockify 0.0.0.0:6081 localhost:5900 --web=/usr/share/novnc &
+# Bound to container loopback: the host reaches it via the published port.
+# Never 0.0.0.0 — the display is unauthenticated by design and must only be
+# reachable through the compose port mapping / funnel path.
+websockify 127.0.0.1:6081 localhost:5900 --web=/usr/share/novnc &
 DISPLAY_URL="${DISPLAY_URL:-https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F}"
 echo "[display] noVNC ready: $DISPLAY_URL"
 
@@ -74,7 +77,7 @@ watchdog_chrome() {
             --disable-blink-features=AutomationControlled \
             --window-size=1280,800 \
             --remote-debugging-port=${CHROME_CDP_PORT} \
-            --remote-debugging-address=0.0.0.0 \
+            --remote-debugging-address=127.0.0.1 \
             --no-first-run --disable-default-apps \
             --disable-popup-blocking --disable-translate \
             "about:blank" &
@@ -92,15 +95,19 @@ watchdog_chrome() {
         done
         [ "$ready" -eq 0 ] && echo "[browser] WARNING: CDP not ready after 10s (PID ${CHROMIUM_PID})"
 
-        # Block until Chromium exits, then loop to restart
-        wait $CHROMIUM_PID 2>/dev/null
+        # Block until Chromium exits, then loop to restart.
+        # `wait || true` is load-bearing: under set -e, a bare `wait` on a
+        # nonzero child exit (crash, OOM-kill, SIGTERM) aborts this function
+        # and silently kills the watchdog — the exact failure that made both
+        # watchdogs dead code before (reproduced 2026-09-20).
+        wait $CHROMIUM_PID 2>/dev/null || true
         restart_count=$((restart_count + 1))
         echo "[browser] Chromium exited (PID ${CHROMIUM_PID}, restart #${restart_count}). Relaunching..."
     done
 }
 
 if [ -x "$CHROMIUM_BIN" ]; then
-    watchdog_chrome &
+    echo "[browser] Chromium binary found; will launch after VPN connect (fail-closed ordering)."
 else
     echo "[browser] WARNING: Chromium binary not found at $CHROMIUM_BIN"
 fi
@@ -152,22 +159,6 @@ nordvpn whitelist add port 9118 2>/dev/null || true
 nordvpn whitelist add port 6081 2>/dev/null || true
 nordvpn whitelist add port 9223 2>/dev/null || true
 
-# ── Connect VPN in background — don't block Jackett / API startup ─
-(
-    COUNTRY="${NORDVPN_COUNTRY:-South_Africa}"
-    GROUP="${NORDVPN_GROUP:-P2P}"
-    TECH="${NORDVPN_TECHNOLOGY:-NordLynx}"
-    sleep 2
-    nordvpn set technology "$TECH" 2>&1 || true
-    sleep 1
-    echo "[vpn] Connecting to $COUNTRY ($GROUP)..."
-    nordvpn connect --group "$GROUP" "$COUNTRY" 2>&1 || \
-    nordvpn connect --group "$GROUP" 2>&1 || \
-    echo "[vpn] VPN connect failed — use POST /vpn/connect to retry"
-    echo "[vpn] $(nordvpn status 2>&1)"
-) &
-
-# ── Jackett watchdog (auto-restarts on crash/update) ──────────
 watchdog_jackett() {
     local restart_count=0
     while true; do
@@ -194,13 +185,57 @@ watchdog_jackett() {
         done
         [ "$ready" -eq 0 ] && echo "[jackett] WARNING: Not ready after 30s (PID ${JACKETT_PID})"
 
-        wait $JACKETT_PID 2>/dev/null
+        # Same set-e guard as the Chromium watchdog: without `|| true` a
+        # SIGKILL (crash or /jackett/restart) aborts the watchdog itself.
+        wait $JACKETT_PID 2>/dev/null || true
         restart_count=$((restart_count + 1))
         echo "[jackett] Exited (PID ${JACKETT_PID}, restart #${restart_count}). Relaunching..."
     done
 }
 
-watchdog_jackett &
+# ── Connect VPN (synchronous — browser/Jackett must NOT start before tunnel) ──
+# Before this change, Chromium launched at the top of the script and its
+# traffic could exit via the host IP during the connect window.
+GROUP="${NORDVPN_GROUP:-P2P}"
+TECH="${NORDVPN_TECHNOLOGY:-NordLynx}"
+COUNTRY="${NORDVPN_COUNTRY:-${CONNECT:-South_Africa}}"
+VPN_UP=0
+nordvpn set technology "$TECH" 2>&1 || true
+for attempt in 1 2 3; do
+    echo "[vpn] Connect attempt ${attempt} -> $COUNTRY ($GROUP)..."
+    if nordvpn connect --group "$GROUP" "$COUNTRY" 2>&1; then
+        for i in $(seq 1 20); do
+            if nordvpn status 2>&1 | grep -q "Connected"; then
+                VPN_UP=1
+                break
+            fi
+            sleep 2
+        done
+        [ "$VPN_UP" -eq 1 ] && break
+    fi
+    sleep 3
+done
+echo "[vpn] $(nordvpn status 2>&1 | head -3)"
+if [ "$VPN_UP" -ne 1 ]; then
+    # Fail-closed: no browser, no Jackett until a tunnel exists.
+    # The API still comes up (below) so POST /vpn/connect can retry; a small
+    # attendant starts browser+Jackett the moment a connection appears.
+    echo "[vpn] FATAL: no tunnel after 3 attempts — browser/Jackett withheld (fail-closed)."
+    (
+        while true; do
+            sleep 30
+            if nordvpn status 2>&1 | grep -q "Connected"; then
+                echo "[vpn] Tunnel detected — starting browser + Jackett."
+                watchdog_chrome &
+                watchdog_jackett &
+                break
+            fi
+        done
+    ) &
+else
+    watchdog_chrome &
+    watchdog_jackett &
+fi
 
 # ── FastAPI server (foreground — keeps container alive) ────────
 echo "[api] Starting FastAPI..."

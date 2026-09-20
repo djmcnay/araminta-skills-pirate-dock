@@ -6,6 +6,11 @@ downloads/
 *.log
 *.tmp
 
+# Secrets — NEVER in the build context (they end up baked into image layers)
+scripts/token.txt
+.env
+.env.*
+
 # Git
 .git/
 .gitignore

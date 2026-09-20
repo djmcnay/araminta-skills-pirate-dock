@@ -12,8 +12,8 @@ services:
     ports:
       - "127.0.0.1:9876:9876" # API — localhost only
       - "127.0.0.1:9118:9118" # Jackett UI — localhost only
-      - "6081:6081"           # websockify/noVNC — Tailscale Funnel proxies this to the Browser URL
-      - "9223:9223"           # Chrome DevTools Protocol — Minty's remote control
+      - "127.0.0.1:6082:6081" # noVNC — host 6082 (host 6081 is taken by the Hermes browser stack); funnel /pirate -> this
+      - "127.0.0.1:9223:9223" # CDP — loopback only (was 0.0.0.0)
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:

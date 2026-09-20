@@ -605,54 +605,65 @@ async def browser_extract_download(
                 }
 
             # ── Phase 6: curl the file ──
-            filename = unquote(token_url.split("/")[-1].split("?")[0])
-            if not filename or len(filename) < 4:
-                filename = f"anna_{md5[:8]}.epub"
-            
-            # Sanitise filename — remove colons and excessive length
-            filename = filename.replace(":", "-").replace(" ", "_")
-            if len(filename) > 120:
-                name, ext = os.path.splitext(filename)
-                filename = f"{name[:80]}{ext}"
+            from orchestrate import safe_download_filename, build_scoped_cookie_header
+            filename = safe_download_filename(token_url, md5)
 
+            part_path = DOWNLOAD_DIR / f".part_{filename}"
+            if part_path.exists():
+                part_path.unlink()
             output_path = DOWNLOAD_DIR / filename
 
             cookies = await page.context.cookies()
-            cookie_str = "; ".join(
-                [f"{c['name']}={c['value']}" for c in cookies if c.get("name")]
-            )
+            origin_host = re.sub(r"^https?://", "", mirror_base).split("/")[0]
+            cookie_str = build_scoped_cookie_header(cookies, origin_host)
 
             proc = await asyncio.create_subprocess_exec(
-                "curl", "-L", "-s", "-o", str(output_path),
+                "curl", "-L", "-sS", "-o", str(part_path),
+                "-w", "%{http_code} %{size_download}",
                 "-H", f"Cookie: {cookie_str}",
                 "-H", "User-Agent: Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
                 "-H", f"Referer: {page.url}",
+                "--fail-with-body",
                 "--max-time", "300",
                 token_url,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _, stderr_bytes = await proc.communicate()
+            stdout, stderr_bytes = await proc.communicate()
+            http_code = (stdout.decode().split() or ["0"])[0] if stdout else "0"
 
-            if proc.returncode == 0 and output_path.exists():
-                file_size = output_path.stat().st_size
-                if file_size > 1024:
+            if (proc.returncode == 0 and http_code == "200"
+                    and part_path.exists() and part_path.stat().st_size > 1024):
+                head = part_path.open("rb").read(512).lower()
+                if head.startswith(b"<!doctype html") or head.startswith(b"<html"):
+                    part_path.unlink(missing_ok=True)
                     return {
                         **result,
-                        "status": "success",
-                        "state": "downloaded",
-                        "message": f"Downloaded {filename} ({file_size:,} bytes)",
-                        "file_path": str(output_path),
-                        "file_size": file_size,
+                        "status": "error",
+                        "state": "html_not_file",
+                        "message": "Download URL returned an HTML page (challenge/error), not the file.",
                         "token_url": token_url,
                     }
+                if output_path.exists():
+                    output_path.unlink()
+                part_path.rename(output_path)
+                return {
+                    **result,
+                    "status": "success",
+                    "state": "downloaded",
+                    "message": f"Downloaded {filename} ({output_path.stat().st_size:,} bytes)",
+                    "file_path": str(output_path),
+                    "file_size": output_path.stat().st_size,
+                    "token_url": token_url,
+                }
 
+            part_path.unlink(missing_ok=True)
             return {
                 **result,
                 "status": "error",
                 "state": "curl_failed",
-                "message": f"curl failed (exit {proc.returncode}): "
+                "message": f"curl failed (exit {proc.returncode}, http {http_code}): "
                 f"{stderr_bytes.decode()[:200] if stderr_bytes else 'no stderr'}",
                 "token_url": token_url,
                 "output_path": str(output_path),

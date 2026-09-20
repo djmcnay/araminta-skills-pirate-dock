@@ -19,6 +19,7 @@ import os
 import json
 import asyncio
 import base64
+import re
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -29,6 +30,36 @@ DISPLAY_URL = os.environ.get(
 )
 CDP_PORT = int(os.environ.get("CDP_PORT", "9223"))
 ANNAS_MIRRORS = ["https://annas-archive.gl", "https://annas-archive.pk", "https://annas-archive.gd"]
+
+# ── Shared safety helpers ────────────────────────────────────
+
+def safe_download_filename(token_url: str, md5: str) -> str:
+    """Derive a strictly-safe basename from a token URL.
+
+    Defence against URL-encoded path traversal (e.g. %2Fapp%2Fserver.py):
+    take the last path segment, URL-decode it, strip anything that is not a
+    safe filename character, and fall back to a generated name.
+    """
+    raw = unquote(token_url.split("/")[-1].split("?")[0])
+    raw = raw.replace("\\", "/").split("/")[-1]          # no separators survive
+    raw = re.sub(r"[^A-Za-z0-9._ ()'&-]", "", raw).strip(". ")  # allowlist charset
+    if len(raw) < 4 or raw in {".", ".."}:
+        raw = f"anna_{md5[:8]}.epub"
+    if len(raw) > 120:
+        name, ext = os.path.splitext(raw)
+        raw = f"{name[:80]}{ext}"
+    return raw
+
+
+def build_scoped_cookie_header(cookies: list, origin_host: str) -> str:
+    """Only send cookies whose domain matches the download origin (+ parent domains)."""
+    host = origin_host.lower()
+    keep = []
+    for c in cookies:
+        d = (c.get("domain") or "").lower().lstrip(".")
+        if d and (host == d or host.endswith("." + d)):
+            keep.append(f"{c['name']}={c['value']}")
+    return "; ".join(keep)
 
 
 def _check_playwright() -> bool:
@@ -299,30 +330,51 @@ async def orchestrate_download(
                 }
 
             # ── Phase 5: Curl the file ──
-            filename = unquote(token_url.split("/")[-1].split("?")[0])
-            if not filename or len(filename) < 4:
-                filename = f"anna_{md5[:8]}.epub"
-            filename = filename.replace(":", "-").replace(" ", "_")
-            if len(filename) > 120:
-                name, ext = os.path.splitext(filename)
-                filename = f"{name[:80]}{ext}"
-
+            filename = safe_download_filename(token_url, md5)
             output_path = DOWNLOAD_DIR / filename
+            # Validate MD5 before it reaches any file path
+            if not re.fullmatch(r"[a-f0-9]{32}", md5):
+                return {**result, "status": "error", "state": "bad_md5",
+                        "message": "md5 must be 32 hex chars"}
+            part_path = DOWNLOAD_DIR / f".part_{filename}"
+            if part_path.exists():
+                part_path.unlink()
+
             cookies = await page.context.cookies()
-            cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies if c.get("name"))
+            origin_host = re.sub(r"^https?://", "", mirror_base).split("/")[0]
+            cookie_str = build_scoped_cookie_header(cookies, origin_host)
 
             proc = await asyncio.create_subprocess_exec(
-                "curl", "-L", "-s", "-o", str(output_path),
+                "curl", "-L", "-sS", "-o", str(part_path),
+                "-w", "%{http_code} %{size_download}",
                 "-H", f"Cookie: {cookie_str}",
                 "-H", "User-Agent: Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
                 "-H", f"Referer: {page.url}",
+                "--fail-with-body",
                 "--max-time", "300",
                 token_url,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
-            _, stderr = await proc.communicate()
+            stdout, stderr = await proc.communicate()
+            http_code = (stdout.decode().split() or ["0"])[0] if stdout else "0"
 
-            if proc.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1024:
+            if (proc.returncode == 0 and http_code == "200"
+                    and part_path.exists() and part_path.stat().st_size > 1024):
+                # Sanity-check content: a challenge page would be HTML, not the real file
+                head = part_path.open("rb").read(512).lower()
+                if head.startswith(b"<!doctype html") or head.startswith(b"<html"):
+                    part_path.unlink(missing_ok=True)
+                    return {
+                        **result,
+                        "status": "error",
+                        "state": "html_not_file",
+                        "message": "Download URL returned an HTML page (challenge/error), not the file.",
+                        "token_url": token_url,
+                    }
+                # Atomic publish: final name only ever holds a verified file
+                if output_path.exists():
+                    output_path.unlink()
+                part_path.rename(output_path)
                 return {
                     **result,
                     "status": "success",
@@ -333,11 +385,12 @@ async def orchestrate_download(
                     "token_url": token_url,
                 }
 
+            part_path.unlink(missing_ok=True)
             return {
                 **result,
                 "status": "error",
                 "state": "curl_failed",
-                "message": f"curl failed (exit {proc.returncode})",
+                "message": f"curl failed (exit {proc.returncode}, http {http_code})",
                 "token_url": token_url,
             }
 

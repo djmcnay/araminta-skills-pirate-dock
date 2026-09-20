@@ -91,9 +91,22 @@ class UfcWatchRequest(BaseModel):
     poll_interval: int = 300  # seconds between polls
 
 # ── VPN helpers ──────────────────────────────────────────────
-def _nordvpn(cmd: str) -> str:
+_SAFE_VALUE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+def _validate_nordvpn_value(value: str, what: str) -> str:
+    """NordVPN server/country names: allowlisted charset, no option-like input."""
+    if not value or not _SAFE_VALUE_RE.fullmatch(value):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {what}. Allowed: letters, digits, underscore, dot, hyphen (max 64).",
+        )
+    if value.startswith("-"):
+        raise HTTPException(status_code=400, detail=f"{what} must not look like a CLI option.")
+    return value
+
+def _nordvpn(*args: str) -> str:
     r = subprocess.run(
-        f"nordvpn {cmd}", shell=True,
+        ["nordvpn", *args],
         capture_output=True, text=True, timeout=30
     )
     return (r.stdout + r.stderr).strip()
@@ -208,9 +221,11 @@ async def get_status():
 @app.post("/vpn/connect")
 async def vpn_connect(req: VpnConnectRequest):
     if req.server:
-        result = _nordvpn(f"connect {req.server}")
+        server = _validate_nordvpn_value(req.server, "server")
+        result = _nordvpn("connect", server)
     else:
-        result = _nordvpn(f"connect --group P2P '{req.country}'")
+        country = _validate_nordvpn_value(req.country, "country")
+        result = _nordvpn("connect", "--group", "P2P", country)
     return {"result": result, "status": vpn_status()}
 
 @app.post("/vpn/disconnect")

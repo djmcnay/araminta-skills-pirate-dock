@@ -15,9 +15,9 @@ A custom-built Docker container running NordVPN (South Africa, P2P), aria2 for d
 **API:** `http://localhost:9876` (published port — no `docker exec` needed)
 **Jackett UI:** `http://localhost:9118` (published port)
 **Human browser display:** `https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F` (public HTTPS via Tailscale Funnel)
-**Browser fallback:** Container-local Playwright/Chromium — launched inside `pirate-dock`; zero host CDP/browser dependency. Headed Chromium uses container display `:1`, x11vnc exports it on `localhost:5900`, websockify bridges VNC→WebSocket on `0.0.0.0:6081` and serves the noVNC HTML5 client from `/usr/share/novnc`. The `path` URL parameter ensures WebSocket traffic routes through Tailscale Funnel's `/pirate/` prefix.
+**Browser fallback:** Container-local Playwright/Chromium — launched inside `pirate-dock`; zero host CDP/browser dependency. Headed Chromium uses container display `:1`, x11vnc exports it on `localhost:5900`, websockify bridges VNC→WebSocket and serves the noVNC HTML5 client from `/usr/share/novnc` (container port 6081, published to the **host as 6082** — host 6081 belongs to the Hermes browser stack). The `path` URL parameter ensures WebSocket traffic routes through Tailscale Funnel's `/pirate/` prefix.
 
-**Tailscale Funnel invariant:** `https://araminta.taild3f7b9.ts.net/pirate/` must proxy to `http://127.0.0.1:6081`. Check with `sudo tailscale funnel status`. Repair with `sudo tailscale funnel --bg --https=443 --set-path=/pirate 6081`. Use Funnel for browser access, and do not overwrite unrelated root routes on `https://araminta.taild3f7b9.ts.net/`.
+**Tailscale Funnel invariant:** `https://araminta.taild3f7b9.ts.net/pirate/` must proxy to `http://127.0.0.1:6082`. Check with `sudo tailscale funnel status`. Repair with `sudo tailscale funnel --bg --https=443 --set-path=/pirate 6082`. (Port changed 2026-09-20: host 6081 is occupied by the Hermes browser-VNC stack, which owns the separate `/browser` funnel path.) Use Funnel for browser access, and do not overwrite unrelated root routes on `https://araminta.taild3f7b9.ts.net/`.
 
 ---
 
@@ -30,7 +30,7 @@ cd ~/Documents/GitHub/pirate-dock
 bash scripts/build.sh
 ```
 
-**After container start:** `run.sh` auto-whitelists the Docker bridge subnet (`172.16.0.0/12`) and published ports (9876, 9118, **6081**) inside NordVPN's killswitch. This is required for the host Pi and Tailscale Funnel to reach the FastAPI/Jackett/websockify endpoints while NordVPN is active. If you manually change ports or networking, the whitelist must match.
+**After container start:** `run.sh` auto-whitelists the Docker bridge subnet (`172.16.0.0/12`) and ports (9876, 9118, 6081, 9223) inside NordVPN's killswitch (whitelisted ports are container-side; the host publishes 9876/9118/6082/9223 all on 127.0.0.1). This is required for the host Pi and Tailscale Funnel to reach the FastAPI/Jackett/websockify endpoints while NordVPN is active. If you manually change ports or networking, the whitelist must match.
 
 ### Browser display URL
 This is the URL Minty should send by WhatsApp when human intervention is needed:
@@ -47,10 +47,10 @@ When automation hits a visual challenge, `browser_fallback.py` launches Chromium
 ```
 Xvfb :1              → virtual framebuffer (1280x800x24)
 x11vnc -display :1   → exports display as VNC on localhost:5900
-websockify :6081 :5900 --web=/usr/share/novnc  → bridges VNC→WebSocket, serves noVNC HTML
+websockify :6081 (container) → published as host :6082 → bridges VNC→WebSocket, serves noVNC HTML
 ```
 
-The user connects through `https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F` → Tailscale Funnel strips `/pirate/` prefix → reaches websockify on `:6081` → bridges to x11vnc on `:5900` → displays Xvfb `:1` with Chromium visible.
+The user connects through `https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F` → Tailscale Funnel strips `/pirate/` prefix → reaches websockify on host `:6082` (container `:6081`) → bridges to x11vnc on `:5900` → displays Xvfb `:1` with Chromium visible.
 
 ### Check status
 ```bash
@@ -269,7 +269,7 @@ This handles the entire chain automatically:
 - Anna's Archive HTML parser (2026-04-14). New UI uses `.js-aarecord-list-outer` container with flex/border-b child divs. Updated `_parse_annas_search()`.
 - Jackett startup deadlock (2026-04-14). `_start_jackett()` now checks for already-running Jackett before starting a new process; accepts HTTP 302 in addition to 200 (Jackett returns 302 for the indexers endpoint).
 - NordVPN killswitch leaked to host Pi (2026-04-17). RESOLVED. Root cause: `network_mode: host` + `CAP_NET_ADMIN` caused NordVPN's iptables killswitch to apply to the Pi's own network namespace, blocking Discord, GitHub, and all non-local Pi connectivity for ~12 hours. Fix: switched to bridge networking — NordVPN's killswitch now operates inside the container's own namespace and physically cannot affect the host. The `test_isolation.py` suite is a regression guard.
-- Docker bridge + killswitch blocked host-to-container API (2026-04-26). RESOLVED. When NordVPN connects inside the container with killswitch enabled, Docker bridge traffic (from host `172.19.0.1`) was dropped. Fix: `run.sh` now auto-whitelists the Docker bridge subnet and published ports (9876, 9118, **6081**) via `nordvpn whitelist add subnet 172.16.0.0/12`, `nordvpn whitelist add port 9876`, `nordvpn whitelist add port 9118`, `nordvpn whitelist add port 6081`. Container must restart to apply. The host can now reach the FastAPI, Jackett, and noVNC endpoints while NordVPN is active.
+- Docker bridge + killswitch blocked host-to-container API (2026-04-26). RESOLVED. When NordVPN connects inside the container with killswitch enabled, Docker bridge traffic (from host `172.19.0.1`) was dropped. Fix: `run.sh` now auto-whitelists the Docker bridge subnet and published ports (9876, 9118, **6081**) via `nordvpn whitelist add subnet 172.16.0.0/12`, `nordvpn whitelist add port 9876`, `nordvpn whitelist add port 9118`, `nordvpn whitelist add port 6081`. Container must restart to apply. (2026-09-20: host port is now 6082.) The host can now reach the FastAPI, Jackett, and noVNC endpoints while NordVPN is active.
 - Playwright runtime installation failure (2026-04-26). RESOLVED. `playwright install chromium` was failing inside the container due to missing shared libraries. Fix: Dockerfile now installs `libnss3`, `xvfb`, and other Chromium system deps at image build time. Chromium is baked into the image at `/root/.cache/ms-playwright/`.
 - Anna's Archive downloads CAPTCHA — old host-CDP approach (2026-04-16). OBSOLETE. Originally used host CDP on port 9222 with xpra. Replaced by container-local Playwright (see 2026-04-26). Host CDP dependency removed.
 - **Old VNC/noVNC approach (2026-04-27).** OBSOLETE. The old manual x11vnc+websockify hack (ports 5998/5999, host display :99) was a desperate workaround that never worked. Now superseded by the clean Dockerfile-baked stack below.
@@ -409,7 +409,7 @@ Never leave David with a silent failure.
 ## Architecture Principles (never violate)
 
 ### Lessons learned (2026-04-30)
-**Display stack:** The canonical browser display is `Xvfb :1 → x11vnc :5900 → websockify :6081 → noVNC`. xpra 3.1 is broken for HTML5 WebSocket — see Red Herring Graveyard. The `path=pirate%2F` URL parameter is MANDATORY for Funnel routing.
+**Display stack:** The canonical browser display is `Xvfb :1 → x11vnc :5900 → websockify :6081 (container) → host :6082 → noVNC`. xpra 3.1 is broken for HTML5 WebSocket — see Red Herring Graveyard. The `path=pirate%2F` URL parameter is MANDATORY for Funnel routing.
 
 **Self-contained images:** Docker images must contain real files, not symlinks to files outside their document root. xpra's jquery.js symlink was the original red herring that wasted hours.
 
@@ -417,7 +417,7 @@ Never leave David with a silent failure.
 
 1. **All VPN traffic originates from INSIDE the container.** Never install/run NordVPN on the host Pi.
 2. **Container is disposable:** `docker compose down && up` should restore everything.
-3. **Host-to-container ports:** API and Jackett stay localhost-only (`127.0.0.1:9876`, `127.0.0.1:9118`). noVNC/websockify display is published as host port `6081` because Tailscale Funnel proxies it to the Browser URL.
+3. **Host-to-container ports:** API and Jackett stay localhost-only (`127.0.0.1:9876`, `127.0.0.1:9118`). noVNC/websockify display is published as host port `6082` (container 6081) because Tailscale Funnel proxies it to the Browser URL. Host 6081 belongs to the Hermes browser stack — do not reclaim it. CDP (9223) is loopback-published, reachable only from inside the container.
 4. **Auto-whitelist Docker bridge subnet** in NordVPN on startup so killswitch doesn't block host access.
 5. **If you need to interact with the browser from within the VPN tunnel, use the noVNC URL** (`https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F`) — never run a browser on the host and route through the container.
 
@@ -433,7 +433,7 @@ Never leave David with a silent failure.
 - VPN kill switch blocks non-VPN traffic INSIDE the container — this is correct and desired. Host networking is unaffected.
 - Token is 64 chars, stored in `.env` and `scripts/token.txt` — never commit `token.txt` to git
 - **Browser stack runs INSIDE the container** via Playwright; no host CDP or noVNC server required
-- **Network mode** is bridge (NOT host) — ports 9876 and 9118 published to `127.0.0.1` only, port 6081 published to `0.0.0.0` for Tailscale Funnel
+- **Network mode** is bridge (NOT host) — ports 9876, 9118, 6082 (container 6081) and 9223 published to `127.0.0.1` only (2026-09-20: no more 0.0.0.0 publishes; funnel /pirate → 6082)
 - **DO NOT change to `network_mode: host`** — this would re-introduce the 2026-04-17 incident where NordVPN's killswitch broke all Pi connectivity
 - **Playwright requirements:** `playwright>=1.50.0` in `requirements.txt`; Dockerfile installs Chromium libs + runs `playwright install chromium`
 - **noVNC display URL:** `https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F` — the `path` parameter is mandatory

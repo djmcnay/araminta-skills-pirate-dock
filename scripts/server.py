@@ -16,6 +16,9 @@ import asyncio
 import subprocess
 import signal
 import re
+import socket
+import time
+import uuid
 from pathlib import Path
 from contextlib import asynccontextmanager
 from urllib.parse import quote
@@ -54,6 +57,34 @@ JACKETT_BIN = "/opt/jackett/jackett"
 JACKETT_API_KEY = os.getenv("JACKETT_API_KEY", "")  # Set after Jackett first run
 DEFAULT_TORRENT_CATEGORIES = os.getenv("TORRENT_CATEGORIES", "2000,5000")
 DOWNLOAD_PROCESSES: dict[int, subprocess.Popen] = {}
+TORRENT_STATUS_FILE = DATA_DIR / "torrent-status-jobs.json"
+
+
+def _load_torrent_status_jobs() -> dict:
+    try:
+        data = json.loads(TORRENT_STATUS_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_torrent_status_jobs(jobs: dict) -> None:
+    temporary = TORRENT_STATUS_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(jobs, sort_keys=True))
+    temporary.replace(TORRENT_STATUS_FILE)
+
+
+def _reserve_rpc_port() -> int:
+    """Reserve a currently unused localhost aria2 RPC port without count-based reuse."""
+    for port in range(6800, 6900):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    raise HTTPException(status_code=503, detail="No aria2 RPC port is available")
+
 
 # Anna's Archive mirrors (tried in order)
 ANNAS_MIRRORS = [
@@ -828,11 +859,11 @@ async def download_magnet(req: TorrentMagnetRequest):
     # Per-job log: aria2 diagnostics were previously lost to DEVNULL, which
     # is why the UFC stall was invisible for 40 minutes. Each job gets its
     # own log file; /downloads/active surfaces the paths.
-    import time as _time
-    job_log = DOWNLOAD_DIR / f".aria2-{_time.strftime('%Y%m%d-%H%M%S')}.log"
-    # unique RPC port per job: base + number of running aria2 processes
-    _r = subprocess.run(["pgrep", "-c", "aria2c"], capture_output=True, text=True)
-    rpc_port = 6800 + (int(_r.stdout.strip() or 0) % 100)
+    # One persistent record per launch lets status bind an aria2 RPC endpoint to
+    # its own launch time.  It is deliberately keyed by RPC port, never title.
+    job_log = DOWNLOAD_DIR / f".aria2-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}.log"
+    rpc_port = _reserve_rpc_port()
+    started_at = time.time()
     cmd = [
         "aria2c",
         "--seed-time=0",
@@ -863,6 +894,16 @@ async def download_magnet(req: TorrentMagnetRequest):
         stderr=subprocess.STDOUT,
     )
     DOWNLOAD_PROCESSES[r.pid] = r
+    jobs = _load_torrent_status_jobs()
+    jobs[str(rpc_port)] = {
+        "job_id": uuid.uuid4().hex,
+        "pid": r.pid,
+        "started_at": started_at,
+        "rpc_port": rpc_port,
+        "log_file": str(job_log),
+        "optional_name": optional_name,
+    }
+    _save_torrent_status_jobs(jobs)
 
     return {
         "status": "started",
@@ -874,6 +915,12 @@ async def download_magnet(req: TorrentMagnetRequest):
     }
 
 # ── Download management ─────────────────────────────────────
+@app.get("/downloads/status-jobs")
+async def status_jobs():
+    """Persistent launch metadata for the read-only torrent status client."""
+    return {"jobs": _load_torrent_status_jobs()}
+
+
 @app.get("/downloads/active")
 async def active_downloads():
     """List running aria2 processes (with per-job log paths)."""

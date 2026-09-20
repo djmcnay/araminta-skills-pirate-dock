@@ -83,6 +83,21 @@ python3 scripts/promote-to-media.py "UFC 331"                 # copy + verify + 
 
 ### Check status
 ```bash
+python3 scripts/dock-status.py          # one trustworthy table
+python3 scripts/dock-status.py --watch  # refresh every 10 seconds
+python3 scripts/dock-status.py --json   # machine-readable form
+```
+
+The torrent table uses live aria2 RPC data only when it can associate an exact
+payload path with a job; it never guesses from similarly named releases, disk
+preallocation, log mtime, or process I/O. `PEERS` is current connections.
+`HEALTH` is `receiving`, `idle`, `stalled`, `starved`, `waiting`, `unknown`, or
+`complete`. `TIME` is a recorded start for receiving jobs, elapsed time since
+last observed payload activity otherwise, or `completed`. A `—` is intentional:
+legacy or ambiguous jobs do not receive invented telemetry.
+
+For basic service health only:
+```bash
 curl -sf http://localhost:9876/status | python3 -m json.tool
 ```
 

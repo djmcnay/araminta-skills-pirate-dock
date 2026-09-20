@@ -46,10 +46,10 @@ Xvfb :1 -screen 0 1280x800x24 -ac +extension GLX +render -noreset &
 sleep 1
 x11vnc -display :1 -forever -shared -localhost -nopw -noxdamage -noxfixes &
 sleep 1
-# Bound to container loopback: the host reaches it via the published port.
-# Never 0.0.0.0 — the display is unauthenticated by design and must only be
-# reachable through the compose port mapping / funnel path.
-websockify 127.0.0.1:6081 localhost:5900 --web=/usr/share/novnc &
+# In-container 0.0.0.0 is correct here: Docker's port publisher connects from
+# the bridge gateway, not container-loopback (loopback bind => funnel 502).
+# The real boundary is the HOST-side publish: 127.0.0.1:6082 in compose.
+websockify 0.0.0.0:6081 localhost:5900 --web=/usr/share/novnc &
 DISPLAY_URL="${DISPLAY_URL:-https://araminta.taild3f7b9.ts.net/pirate/vnc_lite.html?path=pirate%2F}"
 echo "[display] noVNC ready: $DISPLAY_URL"
 

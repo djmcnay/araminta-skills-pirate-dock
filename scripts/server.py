@@ -830,6 +830,9 @@ async def download_magnet(req: TorrentMagnetRequest):
     # own log file; /downloads/active surfaces the paths.
     import time as _time
     job_log = DOWNLOAD_DIR / f".aria2-{_time.strftime('%Y%m%d-%H%M%S')}.log"
+    # unique RPC port per job: base + number of running aria2 processes
+    _r = subprocess.run(["pgrep", "-c", "aria2c"], capture_output=True, text=True)
+    rpc_port = 6800 + (int(_r.stdout.strip() or 0) % 100)
     cmd = [
         "aria2c",
         "--seed-time=0",
@@ -837,8 +840,14 @@ async def download_magnet(req: TorrentMagnetRequest):
         "--summary-interval=10",
         "--max-connection-per-server=4",
         "--split=4",
+        "--enable-rpc=true",
+        "--rpc-listen-all=false",
+        "--rpc-secret=piratedockrpc",
+        "--allow-overwrite=false",
+        "--continue=true",
         "--log", str(job_log),
-        "--log-level=notice",
+        "--log-level=info",
+        f"--rpc-listen-port={rpc_port}",
         f"--max-upload-limit={upload_limit}",
         "--max-overall-upload-limit=" + upload_limit,
         "--max-download-limit=" + download_limit,

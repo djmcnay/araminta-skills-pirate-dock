@@ -113,7 +113,12 @@ def classify(src: Path) -> tuple[str, str, str | None]:
         show = _show_name(src)
         if show:
             show = re.sub(r"(?i)\s*series\s*\d+(-\d+)?\s*$", "", show).strip() or show
-        return "kids", title_case(show or clean_title(stem)), year
+        # TV-shaped kids content -> kids/ (tvshows library); standalone kids
+        # films -> kids-films/ (Kids Movies library, movies type). Films get
+        # indexed as Movies with proper TMDB metadata instead of fake Series.
+        if TV_EPISODE_RE.search(stem) or any(TV_EPISODE_RE.search(f.stem) for f in files):
+            return "kids", title_case(show or clean_title(stem)), year
+        return "kids-films", clean_title(stem), year
 
     # Sports event
     if is_event(lower) or (files and any(is_event(re.sub(r"[._]", " ", f.stem.lower())) for f in files)):

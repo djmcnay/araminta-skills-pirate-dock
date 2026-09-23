@@ -43,6 +43,7 @@ VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".webm", ".mov", ".wmv", ".ts", ".m4v"}
 BOOK_EXTS = {".epub", ".pdf", ".mobi", ".azw3", ".azw"}
 
 KIDS_TITLES = ("fireman sam", "bluey", "peppa", "paw patrol", "hey duggee", "bing",
+                "kiki", "ponyo", "totoro", "ghibli",
                "gruffalo", "room on the broom", "stick man", "shaun the sheep",
                "thomas", "postman pat", "paddington", "horrid henry",
                "pooh", "tigger", "piglet", "heffalump", "eeyore", "hundred acre")

@@ -130,6 +130,30 @@ def main() -> int:
     except Exception as e:
         check("autopromote cron", False, str(e))
 
+    # 4b. Ollama cloud burn-rate (weekly allowance meter)
+    try:
+        log_path = Path("/home/djmcnay/.hermes/ollama-meter/log.jsonl")
+        meter_lines = log_path.read_text().strip().splitlines() \
+            if log_path.exists() else []
+        if not meter_lines:
+            check("Ollama meter", False,
+                  "log.jsonl missing or empty — meter capture not running?")
+            problems.append("Ollama meter log missing")
+        else:
+            sample = json.loads(meter_lines[-1])
+            weekly = sample.get("weekly_usage")
+            week = sample.get("iso_week", "?")
+            top = ", ".join(
+                f"{m.get('name')}:{m.get('request_count')}"
+                for m in (sample.get("weekly_models") or [])[:3])
+            check("Ollama meter", True,
+                  f"week {week}: usage {weekly} of allowance"
+                  + (f"; top models {top}" if top else ""))
+            if isinstance(weekly, (int, float)) and weekly > 0.9:
+                problems.append(f"Ollama weekly allowance {weekly*100:.0f}% used ({week})")
+    except Exception as e:
+        check("Ollama meter", False, str(e))
+
     # 5. watcher journal failure stages
     try:
         state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}

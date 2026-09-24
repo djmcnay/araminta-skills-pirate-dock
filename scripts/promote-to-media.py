@@ -25,6 +25,7 @@ Copies are byte-verified against the source before success. Sources are left
 in place (delete from the dock is a separate, explicit decision).
 """
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -60,12 +61,33 @@ def log(*a):
 
 # ── classification ────────────────────────────────────────────────────────────
 
+QUALITY_TAIL_RE = re.compile(
+    r"(?i)\b(2160p|1080p|720p|web[\- ]?dl|webrip|hdtv|bluray|blu[\- ]?ray|dvdrip|"
+    r"dsnp|amzn|atvp|nf|x264|x265|h\.?264|h\.?265|hevc|ddp?\d?\.?\d?|aac2?\.?0|aac|"
+    r"truehd|atmos)\b.*$")
+
 def clean_title(stem: str) -> str:
     t = re.sub(r"[._]", " ", stem)
     t = re.sub(r"\s+", " ", t).strip()
-    t = re.sub(r"\s+[a-f0-9]{8}\s*$", "", t)           # trailing infohash
-    t = re.sub(r"\s*\[[^\]]+\]\s*$", "", t)            # trailing [tag]
-    t = re.sub(r"\s+\d{4}$", "", t)                    # trailing year (year goes in parens)
+    t = re.sub(r"(?i)^www\s+uindex\s+org\s*-\s*", "", t)  # UIndex wrapper prefix
+    t = re.sub(r"\s+[a-f0-9]{8}\s*$", "", t)            # trailing infohash
+    t = re.sub(r"\[[^\]]*\]", " ", t)                   # ANY bracket tag, anywhere
+    t_quality_pre = t
+    t = QUALITY_TAIL_RE.sub("", t)                      # release-quality tail
+    t = re.sub(r"\s+", " ", t).strip()
+    m = re.search(r"\s*\((\d{4})\)\s*$", t)             # trailing (year)
+    if m:
+        t = t[:m.start()].strip()   # explicit year: do NOT also strip bare years
+    else:                               # ("Blade Runner 2049 (2017)" keeps 2049)
+        t2 = re.sub(r"(?<!\w)\d{4}(?!\w)\s*$", "", t)   # trailing bare year
+        # strip a bare trailing year ONLY when quality tags followed it in the
+        # original name (then it is a release year). A stem-final number is
+        # part of the title (Blade Runner 2049, Apollo 13, film "1984").
+        if t2.strip() and (t != t_quality_pre):
+            t = t2.strip()
+        # else: keep the number — bare final year IS a title (film "1984")
+    if not t or not re.search(r"[A-Za-z0-9]", t):       # loss guard
+        t = stem.strip()
     return t
 
 
@@ -79,8 +101,53 @@ def extract_year(text: str) -> str | None:
 
 
 def video_files(src: Path) -> list[Path]:
+    # File-shaped items (aria2 loose-file downloads) ARE the video file;
+    # returning [] here silently produced empty destinations (verified: 0 copied).
+    if src.is_file():
+        if src.suffix.lower() in VIDEO_EXTS:
+            return [src]
+        # Extensionless magnet output (e.g. "Spider-Man ... NTb"): trust ffprobe.
+        if _probe_is_video(src):
+            return [src]
+        return []
     return sorted(p for p in src.rglob("*")
                   if p.is_file() and p.suffix.lower() in VIDEO_EXTS)
+
+
+_FFMPEG_CACHE: dict[str, bool] = {}
+
+
+def _probe_is_video(p: Path) -> bool:
+    key = f"{p}:{p.stat().st_size}:{int(p.stat().st_mtime)}"
+    if key not in _FFMPEG_CACHE:
+        try:
+            r = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(p)],
+                capture_output=True, text=True, timeout=20)
+            _FFMPEG_CACHE[key] = bool(r.stdout.strip())
+        except Exception:
+            _FFMPEG_CACHE[key] = False
+    return _FFMPEG_CACHE[key]
+
+
+def _container_ext(p: Path) -> str:
+    """Extension for an extensionless video file, from the real container."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=format_name",
+             "-of", "csv=p=0", str(p)],
+            capture_output=True, text=True, timeout=20)
+        fmt = r.stdout.strip().lower()
+    except Exception:
+        fmt = ""
+    if "matroska" in fmt:
+        return ".mkv"
+    if "mp4" in fmt or "mov" in fmt:
+        return ".mp4"
+    if "avi" in fmt:
+        return ".avi"
+    return ".mkv"  # sane default for x265 rips
 
 
 def all_files(src: Path) -> list[Path]:
@@ -98,7 +165,9 @@ def is_event(lower: str) -> bool:
 def classify(src: Path) -> tuple[str, str, str | None]:
     """Return (section, title, year). Section in events|shows|kids|movies|books."""
     files = video_files(src)
-    stem = src.stem
+    # A DIRECTORY's name has no "extension" semantics: Path.stem on
+    # "www.UIndex.org    -    The Odyssey..." mangles it to "www.UIndex".
+    stem = src.name if src.is_dir() else src.stem
     lower = re.sub(r"[._]", " ", stem).lower()
     year = extract_year(stem) or next(
         (extract_year(f.stem) for f in files if extract_year(f.stem)), None)
@@ -125,11 +194,13 @@ def classify(src: Path) -> tuple[str, str, str | None]:
     if is_event(lower) or (files and any(is_event(re.sub(r"[._]", " ", f.stem.lower())) for f in files)):
         return "events", clean_title(stem), year
 
-    # TV: episode markers in the item name or any child file
-    if src.is_dir() and (TV_EPISODE_RE.search(stem)
-                         or any(TV_EPISODE_RE.search(f.stem) for f in files)
-                         or any(p.is_dir() and re.match(r"(?i)(season|series)\s*\d", p.name)
-                                for p in src.iterdir())):
+    # TV: episode markers in the item name or any child file. Loose FILE items
+    # classify here too (a completed loose S01E01.mkv is a TV episode, not a
+    # movie); only the season-dir scan needs a directory.
+    if (TV_EPISODE_RE.search(stem)
+            or any(TV_EPISODE_RE.search(f.stem) for f in files)
+            or (src.is_dir() and any(p.is_dir() and re.match(r"(?i)(season|series)\s*\d", p.name)
+                                     for p in src.iterdir()))):
         return "shows", title_case(_show_name(src) or clean_title(stem)), year
 
     # Movie fallback
@@ -167,24 +238,34 @@ def plan(src: Path) -> tuple[str, Path, list[tuple[Path, Path]]]:
     def _norm(s: str) -> str:
         s = re.sub(r"\s*\(\d{4}\)\s*$", "", s).strip().lower()
         s = re.sub(r"(?i)\s*series\s*\d+(-\d+)?\s*$", "", s)
+        s = s.replace("'", "").replace("\u2019", "")     # Kiki's == Kikis
         return re.sub(r"\s+", " ", s).strip()
+
+    def _year_of(name: str) -> str | None:
+        m = re.search(r"\((\d{4})\)\s*$", name)
+        return m.group(1) if m else None
+
     if section not in ("book",):
         base = MEDIA_ROOT / section
         title_lower = _norm(title)
+        # Merge ONLY on exact normalised-name equality AND compatible year —
+        # bidirectional substring matching merged Paddington into Paddington 2
+        # and remakes into their originals (audit finding 9).
         existing = [p for p in base.iterdir()
-                    if p.is_dir() and (_norm(p.name) == title_lower
-                                       or _norm(title_lower) in _norm(p.name)
-                                       or _norm(p.name) in _norm(title_lower))] if base.exists() else []
-        if existing and section in ("movies", "events"):
+                    if p.is_dir() and _norm(p.name) == title_lower
+                    and (year is None or _year_of(p.name) in (None, year))] \
+            if base.exists() else []
+        if existing and section in ("movies", "events", "kids-films"):
             dest_dir = existing[0]
             moves = []
-            files = video_files(src) if src.is_dir() else ([src] if src.is_file() and src.suffix.lower() in VIDEO_EXTS else [])
+            files = video_files(src)
             for f in files:
                 label_src = re.sub(r"[._]", " ", f.stem)
                 base_name = re.sub(r"\s*\(\d{4}\)$", "", dest_dir.name)
                 label = re.sub("(?i)^" + re.escape(base_name) + r"\s*", "", label_src).strip()
                 label = re.sub(r"\s*\(\d{4}\)\s*$", "", label).strip() or "Feature"
-                dest_name = f"{dest_dir.name} - {clean_title(label)}{f.suffix.lower()}"
+                suffix = f.suffix.lower() or _container_ext(f)
+                dest_name = f"{dest_dir.name} - {clean_title(label)}{suffix}"
                 moves.append((f, dest_dir / dest_name))
             for f in sidecar_files(src):
                 moves.append((f, dest_dir / f.name))
@@ -252,8 +333,11 @@ def plan(src: Path) -> tuple[str, Path, list[tuple[Path, Path]]]:
                 t = re.sub(r"(?i)\b(720p|1080p|2160p|webrip|web[- ]?dl|hdtv|dsnp|amzn|nf|x264|x265|hevc|aac|ddp?5?\.?[01]?|h\.?264)\b.*$", "", t)
                 t = re.sub(r"(?i)\b\d{3,4}p\b", "", t)
                 t = re.sub(r"[-\s]+$", "", t).strip()
+            suffix = f.suffix.lower()
+            if suffix == "":
+                suffix = _container_ext(f)              # extensionless probe
             dest = show_dir / f"Season {season:02d}" / (
-                f"{show} S{season:02d}E{ep:02d}{' - ' + t if t else ''}{f.suffix.lower()}")
+                f"{show} S{season:02d}E{ep:02d}{' - ' + t if t else ''}{suffix}")
             moves.append((f, dest))
         # sidecars (srt/nfo) follow the first video's target dir
         if moves:
@@ -269,20 +353,29 @@ def plan(src: Path) -> tuple[str, Path, list[tuple[Path, Path]]]:
     for f in files:
         label_src = re.sub(r"[._]", " ", f.stem)
         label = re.sub(rf"(?i)^{re.escape(title)}\s*", "", label_src).strip()
+        label = QUALITY_TAIL_RE.sub("", label)              # strip release tail
         label = re.sub(r"\s*\(\d{4}\)\s*$", "", label).strip()
+        label = re.sub(r"(?<!\w)\d{4}(?!\w)\s*$", "", label).strip()
         if label.lower() == title.lower() or not label:
             label = "Feature"
-        moves.append((f, folder / f"{title} ({year}) - {clean_title(label)}{f.suffix.lower()}"))
+        suffix = f.suffix.lower()
+        if suffix == "":
+            suffix = _container_ext(f)                      # extensionless probe
+        moves.append((f, folder / f"{title} ({year}) - {clean_title(label)}{suffix}"))
     for f in sidecar_files(src):
         moves.append((f, folder / f.name))
     return section, folder, moves
 
 
+# sidecar junk: torrent-site droppings, never metadata
+JUNK_SIDECAR_RE = re.compile(r"(?i)torrent\s+downloaded\s+from|uindex\.org")
+
 def sidecar_files(src: Path) -> list[Path]:
     if not src.is_dir():
         return []
     return [p for p in all_files(src)
-            if p.suffix.lower() not in VIDEO_EXTS | BOOK_EXTS | {".aria2"}]
+            if p.suffix.lower() not in VIDEO_EXTS | BOOK_EXTS | {".aria2"}
+            and not JUNK_SIDECAR_RE.search(p.name)]
 
 
 # ── execution ─────────────────────────────────────────────────────────────────
@@ -306,12 +399,13 @@ def scan(ah: str | None) -> None:
     if not ah:
         log("  (skipping library scan — no auth)")
         return
-    r = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                        "--max-time", "30", "-X", "POST",
-                        f"{JELLYFIN}/Library/Refresh",
-                        "-H", f"Authorization: {ah}"],
-                       capture_output=True, text=True)
-    log(f"  library scan triggered: {r.stdout.strip()}")
+    req = urllib.request.Request(f"{JELLYFIN}/Library/Refresh", method="POST",
+                                 headers={"Authorization": ah})
+    try:
+        resp = urllib.request.urlopen(req, timeout=30)
+        log(f"  library scan triggered: HTTP {resp.status}")
+    except Exception as e:
+        log(f"  library scan FAILED: {e}")
 
 
 def main() -> None:
@@ -352,6 +446,19 @@ def main() -> None:
             "Deliver via pull-from-dock.sh to the Mac instead.")
         return
 
+    # duplicate destinations: two different sources mapping to ONE destination
+    # silently overwrote a verified copy (audit finding 1). Distinct releases
+    # differing only in quality both produced "<Title> - Feature.mkv".
+    dests = [d for _, d in moves]
+    if len(dests) != len(set(dests)):
+        seen: dict[Path, Path] = {}
+        for f, d in moves:
+            if d in seen:
+                log(f"ABORT: duplicate destination {d} for both "
+                    f"{seen[d].name} and {f.name} — differentiating label needed")
+                sys.exit(2)
+            seen[d] = f
+
     # conflicts: refuse to overwrite an existing different-size file
     conflicts = [d for _, d in moves if d.exists() and d.stat().st_size != (
         f.stat().st_size if (f := next(x for x, dd in moves if dd == d)) else -1)]
@@ -359,7 +466,9 @@ def main() -> None:
     if real_conflicts:
         same = [d for d in real_conflicts
                 if d.stat().st_size == next(f.stat().st_size for f, dd in moves if dd == d)]
-        if len(same) == len(real_conflicts):
+        if len(same) == len(real_conflicts) and len(real_conflicts) == len(moves):
+            # EVERY planned destination already exists byte-identical — only
+            # then is "nothing to do" true; partial plans must copy the rest
             log("already promoted (all destinations exist with matching sizes) — nothing to do")
             scan(jellyfin_auth())
             return
@@ -367,11 +476,34 @@ def main() -> None:
             f"DIFFERENT sizes — resolve manually: {real_conflicts[:3]}")
         sys.exit(2)
 
+    # plan must copy something real (a plan with zero moves reports success
+    # while copying nothing — audit finding 7)
+    if not moves:
+        if section in ("shows", "kids") and video_files(src):
+            # every episode already exists in the library: a successful no-op,
+            # not an error (the S16-different-encode case churned otherwise)
+            log("already promoted (all episodes present in library) — nothing to do")
+            scan(jellyfin_auth())
+            return
+        log("ABORT: plan produced zero file moves — nothing verified, refusing "
+            "to claim success")
+        sys.exit(2)
+
     dest_dir.mkdir(parents=True, exist_ok=True)
     for f, d in moves:
         d.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(f, d)
-    bad = [(f, d) for f, d in moves if d.stat().st_size != f.stat().st_size]
+        # atomic publish: copy to a unique temp sibling, then os.replace — a
+        # crash or concurrent run can never leave a half-written final file
+        tmp = d.parent / f".part_{os.getpid()}_{d.name}"
+        try:
+            shutil.copy2(f, tmp)
+            if tmp.stat().st_size != f.stat().st_size:
+                raise IOError(f"temp copy size mismatch for {tmp.name}")
+            os.replace(tmp, d)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+    bad = [(f, d) for f, d in moves if not d.exists() or d.stat().st_size != f.stat().st_size]
     if bad:
         log(f"VERIFY FAILED for {len(bad)} file(s): {[str(d) for _, d in bad]}")
         sys.exit(2)

@@ -264,6 +264,7 @@ def plan(src: Path) -> tuple[str, Path, list[tuple[Path, Path]]]:
                 base_name = re.sub(r"\s*\(\d{4}\)$", "", dest_dir.name)
                 label = re.sub("(?i)^" + re.escape(base_name) + r"\s*", "", label_src).strip()
                 label = re.sub(r"\s*\(\d{4}\)\s*$", "", label).strip() or "Feature"
+                label = re.sub(r"(?<!\w)\d{4}(?!\w)\s*$", "", label).strip() or "Feature"
                 suffix = f.suffix.lower() or _container_ext(f)
                 dest_name = f"{dest_dir.name} - {clean_title(label)}{suffix}"
                 moves.append((f, dest_dir / dest_name))

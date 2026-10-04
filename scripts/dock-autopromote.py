@@ -3,18 +3,20 @@
 
 Policy (David, 24 Sept 2026): unless he has asked for an item NOT to be
 promoted, every completed dock download is, on completion:
-  1. decode-checked (mid-file frame decode) BEFORE promotion
-  2. classified + copied byte-verified into the media library (promoter)
-  3. metadata refreshed (Jellyfin scan) and provider-art verified/applied
-  4. dock copy deleted ONLY per verified file (never books, never unknowns)
+  1. format-gated by magic bytes/libmagic and scanned by ClamAV
+  2. decode-checked (mid-file frame decode) BEFORE promotion
+  3. classified + copied byte-verified into the media library (promoter)
+  4. metadata refreshed (Jellyfin scan) and provider-art verified/applied
+  5. dock copy deleted ONLY per verified file (never books, never unknowns)
 
 Exceptions: ONLY David's explicit do-not-promote requests (SKIP_PATTERNS).
 
 State machine (per item, journaled in ~/.local/state/dock-autopromote.json):
-  None -> decode-checked -> promoted -> done (dock_cleared)
-  Failure stages (decode-failed / promote-failed / skipped-no-video) are
-  terminal to the AUTOMATIC pipeline: the agent investigates. --force ITEM
-  resets a failure and re-runs; --retry-failed retries promote-failed items.
+  None -> security_validated -> decode-checked -> promoted -> done
+  Failure stages (format-failed / malware-detected / scan-failed /
+  decode-failed / promote-failed / skipped-no-video) are terminal to the
+  AUTOMATIC pipeline: the agent investigates. --force ITEM resets a failure
+  and re-runs; --retry-failed retries promote-failed items.
   A changed source signature (size/mtime) resets a failure — a re-downloaded
   item is a new item. State persists after EVERY transition.
 
@@ -50,6 +52,107 @@ VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".webm", ".mov", ".wmv", ".ts", ".m4v"}
 BOOK_EXTS = {".epub", ".pdf", ".mobi", ".azw3", ".azw"}
 # torrent-site droppings — disposable once the item is verified
 JUNK_SIDECAR_RE = re.compile(r"(?i)torrent\s+downloaded\s+from|uindex\.org")
+
+EXECUTABLE_MAGICS = {
+    b"MZ": "Windows executable",
+    b"\x7fELF": "ELF executable",
+    b"#!": "script executable",
+    b"\xfe\xed\xfa\xce": "Mach-O executable",
+    b"\xce\xfa\xed\xfe": "Mach-O executable",
+    b"\xfe\xed\xfa\xcf": "Mach-O executable",
+    b"\xcf\xfa\xed\xfe": "Mach-O executable",
+}
+ASF_MAGIC = bytes.fromhex("3026b2758e66cf11a6d900aa0062ce6c")
+
+
+def _magic_video_format(head: bytes) -> str | None:
+    """Identify the container from bytes, never from a torrent's extension."""
+    if head.startswith(b"\x1aE\xdf\xa3"):
+        return "Matroska/WebM"
+    if len(head) >= 12 and head[4:8] == b"ftyp":
+        return "ISO Base Media/QuickTime"
+    if head.startswith(b"RIFF") and head[8:12] == b"AVI ":
+        return "AVI"
+    if head.startswith(ASF_MAGIC):
+        return "ASF/WMV"
+    if head.startswith(b"\x00\x00\x01\xba"):
+        return "MPEG program stream"
+    if head.startswith(b"FLV"):
+        return "Flash video"
+    # MPEG-TS packets are normally 188 bytes; M2TS adds a four-byte prefix.
+    if ((len(head) > 188 and head[0] == 0x47 and head[188] == 0x47)
+            or (len(head) > 196 and head[4] == 0x47 and head[196] == 0x47)):
+        return "MPEG transport stream"
+    return None
+
+
+def format_gate(path: Path) -> tuple[bool, str]:
+    """Reject executable/unknown payloads before ffprobe or promotion.
+
+    The extension is deliberately ignored: a real poisoned NTb torrent shipped
+    a PE executable named as a movie. Known container magic is sufficient;
+    otherwise libmagic must classify the payload as video.
+    """
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(4096)
+    except OSError as e:
+        return False, f"cannot read payload: {e}"
+
+    for magic, label in EXECUTABLE_MAGICS.items():
+        if head.startswith(magic):
+            return False, label
+
+    container = _magic_video_format(head)
+    if container:
+        return True, container
+
+    try:
+        result = subprocess.run(
+            ["file", "--brief", "--mime-type", "--", str(path)],
+            capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"file inspection failed: {e}"
+    mime = result.stdout.strip()
+    if result.returncode == 0 and mime.startswith("video/"):
+        return True, mime
+    return False, f"unrecognised media format (file: {mime or 'unknown'})"
+
+
+def clamav_check(path: Path) -> tuple[bool, str]:
+    """Scan one payload with ClamAV; scanner absence/errors fail closed."""
+    try:
+        result = subprocess.run(
+            ["clamscan", "--no-summary", "--stdout", "--infected",
+             "--alert-exceeds-max=yes", "--", str(path)],
+            capture_output=True, text=True, timeout=900)
+    except FileNotFoundError:
+        return False, "ClamAV is not installed"
+    except subprocess.TimeoutExpired:
+        return False, "ClamAV scanner error: timed out"
+    except OSError as e:
+        return False, f"ClamAV scanner error: {e}"
+
+    output = "\n".join(part.strip() for part in (result.stdout, result.stderr)
+                       if part and part.strip())
+    if result.returncode == 0:
+        return True, "clean"
+    if result.returncode == 1:
+        return False, output or "malware detected"
+    return False, f"ClamAV scanner error (rc={result.returncode}): {output}"
+
+
+def validate_media(path: Path) -> tuple[str, str]:
+    """Run cheap format rejection first, then antivirus validation."""
+    valid_format, detail = format_gate(path)
+    if not valid_format:
+        return "format-failed", detail
+    clean, detail = clamav_check(path)
+    if not clean:
+        if "scanner error" in detail.lower() or "not installed" in detail.lower():
+            return "scan-failed", detail
+        return "malware-detected", detail
+    return "clean", detail
 
 # David's explicit exceptions (substring match, case-insensitive).
 # Add a line here ONLY when David asks for an item to be left in the dock.
@@ -339,16 +442,19 @@ def promote_item(item: Path, state: dict, dry: bool) -> None:
     st = state.setdefault(name, {})
     stage = st.get("stage")
 
-    # source-change invalidation: a re-downloaded item is a new item
+    # source-change invalidation: a re-downloaded/replaced item is a new item.
+    # This applies to successful gates too: replacing bytes after validation
+    # must never inherit an earlier clean result.
     vids = video_files_of(item)
     sig = source_signature(vids) if vids else None
-    if stage in ("decode-failed", "promote-failed", "skipped-no-video") \
-            and sig and st.get("source_sig") not in (None, sig):
-        log(f"source changed since {stage}: {name} — resetting")
+    recorded_sig = st.get("validation_source_sig") or st.get("source_sig")
+    if sig and recorded_sig not in (None, sig):
+        log(f"source changed since {stage or 'validation'}: {name} — resetting")
         st.clear()
         stage = None
 
-    if stage in ("done", "book-noted", "skipped", "decode-failed",
+    if stage in ("done", "book-noted", "skipped", "format-failed",
+                 "malware-detected", "scan-failed", "decode-failed",
                  "promote-failed", "skipped-no-video", "superseded-duplicate"):
         return
     if has_control_file(item):
@@ -370,7 +476,25 @@ def promote_item(item: Path, state: dict, dry: bool) -> None:
         log(f"DRY: would process {name}")
         return
 
-    # ── 0. pre-promote duplicate check: if the library ALREADY holds an
+    # ── 0. Security gate every payload before promotion or duplicate cleanup.
+    # Old decode-checked/promoted journal entries intentionally have no
+    # validation_source_sig, so they receive the new gate on their next pass.
+    if st.get("validation_source_sig") != sig:
+        for v in vids:
+            status, detail = validate_media(v)
+            if status != "clean":
+                label = status.upper()
+                log(f"{label} {name}: {v.name} — {detail}; NOT promoted")
+                st.update(stage=status, source_sig=sig, at=time.time(),
+                          validation_detail=detail)
+                save_state(state)
+                return
+            log(f"  security clean: {v.name}")
+        st.update(security_validated=True, validation_source_sig=sig,
+                  source_sig=sig, at=time.time())
+        save_state(state)
+
+    # ── 1. pre-promote duplicate check: if the library ALREADY holds an
     # identity-verified copy of every video, skip promotion (a twin folder
     # would be created) and go straight to clearing the duplicate.
     by_size0 = library_files_by_size()
@@ -385,7 +509,7 @@ def promote_item(item: Path, state: dict, dry: bool) -> None:
             save_state(state)
         return
 
-    # ── 1. decode-check every video BEFORE promotion (skip if already done)
+    # ── 2. decode-check every video BEFORE promotion (skip if already done)
     if stage not in ("promoted", "decode-checked"):
         sig = source_signature(vids)
         for v in vids:
@@ -397,7 +521,7 @@ def promote_item(item: Path, state: dict, dry: bool) -> None:
         st.update(stage="decode-checked", source_sig=sig, at=time.time())
         save_state(state)
 
-    # ── 2. promote (byte-verified inside the promoter; it aborts on conflicts)
+    # ── 3. promote (byte-verified inside the promoter; it aborts on conflicts)
     r = subprocess.run(
         ["python3", str(SCRIPTS / "promote-to-media.py"), name],
         capture_output=True, text=True, timeout=7200)
@@ -414,7 +538,7 @@ def promote_item(item: Path, state: dict, dry: bool) -> None:
     st.update(stage="promoted", at=time.time(), already_promoted=already)
     save_state(state)
 
-    # ── 3. provider-art verification on the LIBRARY copy (audit finding 6).
+    # ── 4. provider-art verification on the LIBRARY copy (audit finding 6).
     # Never blocks deletion; failures are flagged for agent-side repair
     # per the jellyfin-thumbnails skill (RemoteImages/Download first).
     try:
@@ -435,7 +559,7 @@ def promote_item(item: Path, state: dict, dry: bool) -> None:
         st["art"] = "unknown"
         save_state(state)
 
-    # ── 4. verify + clear: identity-verified deletion (audit findings 1, 2, 5).
+    # ── 5. verify + clear: identity-verified deletion (audit findings 1, 2, 5).
     # Byte-size equality alone authorized deleting a DIFFERENT film of
     # coincidentally equal size. So: sha256 every video file against the
     # library candidates of equal size; only identity-matched files are
@@ -517,8 +641,9 @@ def main() -> None:
             log(f"force target not a dock child or not found: {force_item}")
             sys.exit(2)
         st = state.setdefault(force_item, {})
-        if st.get("stage") in ("decode-failed", "promote-failed",
-                               "skipped-no-video", "done",
+        if st.get("stage") in ("format-failed", "malware-detected",
+                               "scan-failed", "decode-failed",
+                               "promote-failed", "skipped-no-video", "done",
                                "superseded-duplicate"):
             log(f"resetting state for {force_item} (was {st.get('stage')})")
             st.clear()

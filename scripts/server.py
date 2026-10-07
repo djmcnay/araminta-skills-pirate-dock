@@ -21,7 +21,7 @@ import time
 import uuid
 from pathlib import Path
 from contextlib import asynccontextmanager
-from urllib.parse import quote
+from urllib.parse import quote, unquote_plus
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -914,6 +914,237 @@ async def download_magnet(req: TorrentMagnetRequest):
         "limits": {"upload": upload_limit, "download": download_limit},
     }
 
+def _queue_item(job: dict, live: dict | None, error: str | None = None) -> dict:
+    """Normalize measured telemetry; never infer bytes from allocated files."""
+    name = job.get("optional_name") or job.get("name") or f"Job {job.get('job_id', '?')}"
+    item = {"job_id": job.get("job_id"), "rpc_port": job.get("rpc_port"),
+            "started_at": job.get("started_at"), "name": name, "status": "stopped",
+            "progress": {"downloaded": None, "total": None, "percent": None},
+            "download_speed": None, "upload_speed": None, "connections": None,
+            "error": error, "error_code": None, "telemetry_available": False, "files": []}
+    if live is None:
+        return item
+    info = live.get("bittorrent", {}).get("info", {})
+    files = live.get("files", [])
+    item["files"] = [{"path": f.get("path", "").removeprefix("/downloads/"),
+                      "length": int(f.get("length", 0)),
+                      "completed": int(f.get("completedLength", 0))}
+                     for f in files if f.get("path") and not live.get("bittorrent", {}).get("mode") == "metadata"]
+    item["name"] = info.get("name") or (Path(files[0]["path"]).name if files and files[0].get("path") else name)
+    total = int(live.get("totalLength", 0))
+    downloaded = int(live.get("completedLength", 0))
+    raw_status = live.get("status", "removed")
+    item.update({"gid": live.get("gid"), "aria2_status": raw_status,
+                 "status": "completed" if raw_status == "complete" else
+                 "seeding" if raw_status == "active" and live.get("seeder") == "true" else
+                 "downloading" if raw_status in ("active", "waiting") else "stopped",
+                 "progress": {"downloaded": downloaded, "total": total,
+                              "percent": downloaded / total * 100 if total else None},
+                 "download_speed": int(live.get("downloadSpeed", 0)),
+                 "upload_speed": int(live.get("uploadSpeed", 0)),
+                 "connections": int(live.get("connections", 0)),
+                 "error": live.get("errorMessage") or error,
+                 "error_code": live.get("errorCode"), "telemetry_available": True})
+    return item
+
+
+async def _queue_job(client, job: dict) -> list:
+    """Read a launch's own RPC process, retaining offline launch records."""
+    job = dict(job)
+    if not job.get("optional_name"):
+        try:
+            with Path(job.get("log_file", "")).open("rb") as log:
+                text = log.read(65536)
+                log.seek(max(0, log.seek(0, 2) - 65536))
+                text += log.read(65536)
+            names = re.findall(r"Download (?:GID#\w+ not complete|complete): (.+)", text.decode(errors="replace"))
+            if names:
+                job["name"] = unquote_plus(names[-1].removeprefix("[METADATA]"))
+        except OSError:
+            pass
+    try:
+        # A recycled PID/port must never attach another launch's telemetry.
+        cmd = Path(f"/proc/{int(job['pid'])}/cmdline").read_bytes().split(b"\0")
+        if b"aria2c" not in [Path(p.decode(errors="replace")).name.encode() for p in cmd[:1]] or str(job['log_file']).encode() not in cmd:
+            raise ValueError("Tracked aria2 process is no longer running")
+        port = int(job['rpc_port'])
+        if not 6800 <= port < 6900:
+            raise ValueError("Invalid tracked RPC port")
+        live = []
+        for method in ("tellActive", "tellWaiting", "tellStopped"):
+            offset = 0
+            while True:
+                params = ["token:piratedockrpc"] + ([] if method == "tellActive" else [offset, 100])
+                response = await client.post(f"http://127.0.0.1:{port}/jsonrpc", json={
+                    "jsonrpc": "2.0", "id": "queue", "method": f"aria2.{method}", "params": params})
+                response.raise_for_status()
+                data = response.json()
+                if "error" in data:
+                    raise ValueError(str(data['error']))
+                page = data['result']
+                live.extend(page)
+                if method == "tellActive" or len(page) < 100:
+                    break
+                offset += 100
+                if offset >= 10000:
+                    raise ValueError("RPC history exceeds queue read limit")
+        # Completed magnet-metadata rows are not completed payload downloads.
+        live = [row for row in live if not row.get('followedBy')]
+        if live:
+            return [_queue_item(job, row) for row in live]
+        return [_queue_item(job, None, "No live RPC records; historical outcome unknown")]
+    except (OSError, ValueError, KeyError, httpx.HTTPError) as exc:
+        return [_queue_item(job, None, f"Telemetry unavailable: {exc}")]
+
+
+@app.get("/queue")
+async def get_queue():
+    """Read-only launch history plus live telemetry; unknown values are null."""
+    tracked = _load_torrent_status_jobs()
+    if not tracked:
+        return {"jobs": [], "total": 0}
+    async with httpx.AsyncClient(timeout=2.0, trust_env=False) as client:
+        groups = await asyncio.gather(*(_queue_job(client, job) for job in tracked.values()))
+    jobs = [job for group in groups for job in group]
+    return {"jobs": jobs, "total": len(jobs)}
+
+
+# ── Selected-job controls ────────────────────────────────────
+class QueueActionRequest(BaseModel):
+    gid: str = Field(pattern=r"^[0-9a-fA-F]{16}$")
+    confirm: bool = False
+    dry_run: bool = False
+
+
+async def _action_job(job_id: str, gid: str):
+    tracked = next((j for j in _load_torrent_status_jobs().values() if j.get("job_id") == job_id), None)
+    if tracked is None:
+        raise HTTPException(404, "Unknown job")
+    async with httpx.AsyncClient(timeout=3, trust_env=False) as client:
+        rows = await _queue_job(client, tracked)
+    row = next((r for r in rows if r.get("gid") == gid and r.get("telemetry_available")), None)
+    if row is None:
+        raise HTTPException(409, "Job is offline or its GID changed; refresh the queue")
+    return tracked, row
+
+
+async def _action_rpc(job_id: str, gid: str, method: str):
+    tracked, row = await _action_job(job_id, gid)
+    permitted = {"pause": {"active", "waiting"}, "unpause": {"paused"},
+                 "remove": {"paused"}, "removeDownloadResult": {"complete", "error", "removed"}}
+    if row.get("aria2_status") not in permitted[method]:
+        raise HTTPException(409, f"Cannot {method} a {row.get('aria2_status')} job")
+    async with httpx.AsyncClient(timeout=5, trust_env=False) as client:
+        response = await client.post(f"http://127.0.0.1:{int(tracked['rpc_port'])}/jsonrpc", json={
+            "jsonrpc": "2.0", "id": "action", "method": f"aria2.{method}",
+            "params": ["token:piratedockrpc", gid]})
+        response.raise_for_status()
+        result = response.json()
+    if "error" in result:
+        raise HTTPException(409, str(result["error"]))
+    return result["result"]
+
+
+@app.post("/queue/{job_id}/pause")
+async def queue_pause(job_id: str, req: QueueActionRequest):
+    await _action_rpc(job_id, req.gid, "pause")
+    return {"message": "Pause requested. Refreshing measured status."}
+
+
+@app.post("/queue/{job_id}/resume")
+async def queue_resume(job_id: str, req: QueueActionRequest):
+    await _action_rpc(job_id, req.gid, "unpause")
+    return {"message": "Resume requested. Refreshing measured status."}
+
+
+def _payload_paths(row):
+    root = DOWNLOAD_DIR.resolve()
+    paths = []
+    for entry in row.get("files", []):
+        relative = Path(entry["path"])
+        if relative.is_absolute() or not relative.parts or any(p in ("..", ".") or p.startswith('.') for p in relative.parts):
+            raise HTTPException(409, "Unsafe payload path")
+        path = root / relative
+        if any(p.is_symlink() for p in [path, *path.parents] if p != root and p.is_relative_to(root)):
+            raise HTTPException(409, "Symlink payloads are not actionable")
+        if not path.resolve().is_relative_to(root) or not path.is_file():
+            raise HTTPException(409, "Payload is missing or outside downloads")
+        paths.append(path)
+    if not paths:
+        raise HTTPException(409, "No verified payload files available")
+    return paths
+
+
+@app.post("/queue/{job_id}/transfer")
+async def queue_transfer(job_id: str, req: QueueActionRequest):
+    _, row = await _action_job(job_id, req.gid)
+    if row.get("aria2_status") != "complete":
+        raise HTTPException(409, "Only a measured completed payload can be transferred")
+    paths = _payload_paths(row)
+    tops = {p.relative_to(DOWNLOAD_DIR.resolve()).parts[0] for p in paths}
+    if len(tops) != 1:
+        raise HTTPException(409, "Payload spans multiple dock items; transfer manually")
+    item = next(iter(tops))
+    if req.dry_run:
+        return {"status": "dry-run", "item": item, "files": row["files"]}
+    spool = DOWNLOAD_DIR / ".dashboard-transfers"
+    if not spool.is_dir():
+        raise HTTPException(503, "Dashboard transfer worker is not running")
+    request_id = f"{job_id}-{req.gid}"
+    request_path = spool / f"{request_id}.request.json"
+    result_path = spool / f"{request_id}.result.json"
+    if not request_path.exists():
+        temporary = spool / f"{request_id}.{uuid.uuid4().hex}.tmp"
+        temporary.write_text(json.dumps({"job_id": job_id, "gid": req.gid, "item": item, "files": row["files"]}))
+        temporary.replace(request_path)
+    result = json.loads(result_path.read_text()) if result_path.exists() else {"status": "queued"}
+    return {"request_id": request_id, "message": f"Transfer {result['status']}. Source files are retained.", **result}
+
+
+@app.get("/transfers/{request_id}")
+async def transfer_status(request_id: str):
+    if not re.fullmatch(r"[0-9a-f]{32}-[0-9a-fA-F]{16}", request_id):
+        raise HTTPException(400, "Invalid transfer ID")
+    spool = DOWNLOAD_DIR / ".dashboard-transfers"
+    result = spool / f"{request_id}.result.json"
+    if result.exists():
+        return json.loads(result.read_text())
+    if (spool / f"{request_id}.request.json").exists():
+        return {"status": "queued"}
+    raise HTTPException(404, "Unknown transfer")
+
+
+@app.post("/queue/{job_id}/delete")
+async def queue_delete(job_id: str, req: QueueActionRequest):
+    if not req.confirm:
+        raise HTTPException(400, "Explicit deletion confirmation required")
+    _, row = await _action_job(job_id, req.gid)
+    if row.get("aria2_status") not in ("paused", "complete", "error"):
+        raise HTTPException(409, "Pause this download before deleting it")
+    paths = _payload_paths(row)
+    # Refuse shared payloads: a duplicate launch must not lose its files.
+    queue = await get_queue()
+    selected = {str(p.relative_to(DOWNLOAD_DIR.resolve())) for p in paths}
+    for other in queue["jobs"]:
+        if (other.get("job_id"), other.get("gid")) != (job_id, req.gid):
+            if selected.intersection(f["path"] for f in other.get("files", [])):
+                raise HTTPException(409, "Another tracked job references these files")
+    spool = DOWNLOAD_DIR / ".dashboard-transfers"
+    for request_path in spool.glob("*.request.json"):
+        request = json.loads(request_path.read_text())
+        if selected.intersection(f["path"] for f in request.get("files", [])):
+            result_path = request_path.with_name(request_path.name.replace('.request.json', '.result.json'))
+            if not result_path.exists() or json.loads(result_path.read_text()).get("status") not in ("completed", "failed"):
+                raise HTTPException(409, "A transfer of these files is queued or running")
+    if req.dry_run:
+        return {"status": "dry-run", "files": sorted(selected)}
+    await _action_rpc(job_id, req.gid, "remove" if row["aria2_status"] == "paused" else "removeDownloadResult")
+    # Delete only the enumerated payload files, never a recursive directory or logs.
+    for path in _payload_paths(row):
+        path.unlink()
+    return {"message": f"Deleted {len(paths)} payload files. Empty folders and resume controls retained."}
+
+
 # ── Download management ─────────────────────────────────────
 @app.get("/downloads/status-jobs")
 async def status_jobs():
@@ -1079,3 +1310,5 @@ async def _poll_ufc(key: str, event: str, quality: str, interval: int):
             break
 
         await asyncio.sleep(interval)
+
+

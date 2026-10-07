@@ -150,7 +150,7 @@ def main() -> int:
                   f"week {week}: usage {weekly} of allowance"
                   + (f"; top models {top}" if top else ""))
             if isinstance(weekly, (int, float)) and weekly > 0.9:
-                problems.append(f"Ollama weekly allowance {weekly*100:.0f}% used ({week})")
+                notes.append(f"Ollama weekly allowance {weekly*100:.0f}% used ({week})")
     except Exception as e:
         check("Ollama meter", False, str(e))
 

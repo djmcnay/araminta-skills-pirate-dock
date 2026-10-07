@@ -467,6 +467,14 @@ Never leave David with a silent failure.
 
 ---
 
+## Workflow: "download it and shout when promoted"
+
+Reliable completion-watch pattern (proven 2026-10-04, UFC 332 dual download):
+1. Magnet extraction for LimeTorrents-type results: the Jackett `/dl/` link 302-redirects to the real `magnet:` — curl `-D -` the fresh link and take the `Location:` header (search JSON `magnet` field is often empty; links expire, re-search before fetching).
+2. Progress ground truth when `dock-status.py` says `waiting/unknown`: count distinct `have index=` lines in the job's `/downloads/.aria2-*.log` vs total pieces (piece size from `--summary`/control file). The `.aria2` control file's trailing bitfield also decodes % verified.
+3. Watch via **cron monitor job** (`monitor: ~/.hermes/scripts/<name>-monitor.py`, `*/10 * * * *`, deliver telegram) — NOT a background bash watcher. The monitor script must print deterministic state lines (e.g. `720_full=DOWNLOADING 1080_main=DOWNLOADING`, states PROMOTED/DONE/DOWNLOADING/AWAITING from: find in MEDIA_ROOT, `.aria2` control file, `docker exec pirate-dock pgrep -af aria2c | grep <btih>`); the agent run fires only on state change, promotes via `promote-to-media.py`, verifies with `find /home/djmcnay/Media`, then removes its own cron job when everything is PROMOTED. Give the job id back to David as the handle.
+4. `terminal(background=true, notify=...)` is unreliable in this runtime (rejects both bool and list forms); don't build flows that depend on process-exit notifications.
+
 ## Notes
 
 - Downloads land in `/downloads` inside the container, mapped to `./downloads` on the host (bind mount)

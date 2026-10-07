@@ -120,7 +120,68 @@ def format_gate(path: Path) -> tuple[bool, str]:
 
 
 def clamav_check(path: Path) -> tuple[bool, str]:
-    """Scan one payload with ClamAV; scanner absence/errors fail closed."""
+    """Scan one payload with ClamAV; scanner absence/errors fail closed.
+
+    Oversized files are split into 1900MiB chunks because clamscan cannot read
+    beyond 2GiB minus one.
+    """
+    import shutil
+    import tempfile
+
+    chunk_threshold = 2 * 1024 * 1024 * 1024 - 1024 * 1024
+    chunk_size = 1900 * 1024 * 1024
+    try:
+        size = path.stat().st_size
+    except OSError as e:
+        return False, f"ClamAV scanner error: {e}"
+
+    if size > chunk_threshold:
+        chunk_count = (size + chunk_size - 1) // chunk_size
+        if shutil.disk_usage(tempfile.gettempdir()).free < size:
+            return False, "ClamAV scanner error: insufficient space for chunked scan"
+        try:
+            with tempfile.TemporaryDirectory() as chunk_dir:
+                with path.open("rb") as source:
+                    for index in range(chunk_count):
+                        chunk_path = Path(chunk_dir) / f"chunk-{index:06d}"
+                        with chunk_path.open("wb") as chunk:
+                            remaining = min(chunk_size, size - index * chunk_size)
+                            while remaining:
+                                data = source.read(min(8 * 1024 * 1024, remaining))
+                                if not data:
+                                    return False, "ClamAV scanner error: chunked scan input changed"
+                                chunk.write(data)
+                                remaining -= len(data)
+                result = subprocess.run(
+                    ["clamscan", "--no-summary", "--stdout", "--infected",
+                     "--max-filesize=1999M", "--max-scansize=1999M", "--",
+                     chunk_dir],
+                    capture_output=True, text=True, timeout=900 * chunk_count)
+        except FileNotFoundError:
+            return False, "ClamAV is not installed"
+        except subprocess.TimeoutExpired:
+            return False, f"ClamAV scanner error: timed out (chunks={chunk_count}, infected=0)"
+        except OSError as e:
+            return False, f"ClamAV scanner error: {e}"
+
+        output = "\n".join(part.strip() for part in (result.stdout, result.stderr)
+                           if part and part.strip())
+        infected = sum(line.rstrip().endswith("FOUND")
+                       for line in output.splitlines())
+        infected_summary = re.search(r"Infected files:\s*(\d+)", output)
+        if infected_summary:
+            infected = max(infected, int(infected_summary.group(1)))
+        if result.returncode == 0 and infected == 0:
+            return True, "clean"
+        if result.returncode != 0 or infected > 0:
+            if infected == 0:
+                return False, (f"ClamAV scanner error: chunked scan failed. "
+                               f"(chunks={chunk_count}, infected={infected}, "
+                               f"rc={result.returncode}): {output or 'no output'}")
+            return False, (f"ClamAV malware detected in chunked scan "
+                           f"(chunks={chunk_count}, infected={infected}): "
+                           f"{output or 'no output'}")
+
     try:
         result = subprocess.run(
             ["clamscan", "--no-summary", "--stdout", "--infected",

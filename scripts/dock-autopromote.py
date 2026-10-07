@@ -154,7 +154,7 @@ def clamav_check(path: Path) -> tuple[bool, str]:
                                 remaining -= len(data)
                 result = subprocess.run(
                     ["clamscan", "--no-summary", "--stdout", "--infected",
-                     "--max-filesize=0", "--max-scansize=0", "--",
+                     "--max-filesize=0", "--max-scansize=0", "--max-scantime=0", "--",
                      chunk_dir],
                     capture_output=True, text=True, timeout=900 * chunk_count)
         except FileNotFoundError:
@@ -186,6 +186,7 @@ def clamav_check(path: Path) -> tuple[bool, str]:
         result = subprocess.run(
             ["clamscan", "--no-summary", "--stdout", "--infected",
              "--alert-exceeds-max=yes", "--max-filesize=0", "--max-scansize=0",
+             "--max-scantime=0",
              "--", str(path)],
             capture_output=True, text=True, timeout=900)
     except FileNotFoundError:

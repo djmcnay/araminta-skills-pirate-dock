@@ -17,6 +17,8 @@ State machine (per item, journaled in ~/.local/state/dock-autopromote.json):
   decode-failed / promote-failed / skipped-no-video) are terminal to the
   AUTOMATIC pipeline: the agent investigates. --force ITEM resets a failure
   and re-runs; --retry-failed retries promote-failed items.
+  scan-limit (ClamAV resource-cap notice, NOT malware) is retryable, never
+  terminal: the next pass re-scans automatically. --force also resets it.
   A changed source signature (size/mtime) resets a failure — a re-downloaded
   item is a new item. State persists after EVERY transition.
 
@@ -119,11 +121,33 @@ def format_gate(path: Path) -> tuple[bool, str]:
     return False, f"unrecognised media format (file: {mime or 'unknown'})"
 
 
+# One base flag list for BOTH clamscan branches (fix: unify). ``=0``
+# disables each cap (verified on ClamAV 1.4.3); ``--alert-exceeds-max=no``
+# makes any residual over-limit a silent skip rather than a Heuristics
+# "detection", so both branches classify identically.
+CLAMSCAN_BASE = ["--no-summary", "--stdout", "--infected",
+                 "--alert-exceeds-max=no",
+                 "--max-filesize=0", "--max-scansize=0", "--max-scantime=0"]
+
+# ``scan-limit`` is retryable, NOT terminal: a resource-cap notice is never
+# malware. It is deliberately absent from the terminal early-return list in
+# promote_item() so the next pass re-scans automatically; --force resets it.
+SCAN_LIMIT_STAGE = "scan-limit"
+FORCE_RESET_STAGES = ("format-failed", "malware-detected", "scan-failed",
+                      SCAN_LIMIT_STAGE, "decode-failed",
+                      "promote-failed", "skipped-no-video", "done",
+                      "superseded-duplicate")
+
+
 def clamav_check(path: Path) -> tuple[bool, str]:
     """Scan one payload with ClamAV; scanner absence/errors fail closed.
 
     Oversized files are split into 1900MiB chunks because clamscan cannot read
-    beyond 2GiB minus one.
+    beyond 2GiB minus one. Both branches share CLAMSCAN_BASE: ``=0`` disables
+    each cap (verified empirically on ClamAV 1.4.3) and
+    ``--alert-exceeds-max=no`` makes any over-limit a silent skip as
+    belt-and-suspenders, so identical limit conditions yield identical
+    verdicts on either branch.
     """
     import shutil
     import tempfile
@@ -153,8 +177,7 @@ def clamav_check(path: Path) -> tuple[bool, str]:
                                 chunk.write(data)
                                 remaining -= len(data)
                 result = subprocess.run(
-                    ["clamscan", "--no-summary", "--stdout", "--infected",
-                     "--max-filesize=0", "--max-scansize=0", "--max-scantime=0", "--",
+                    ["clamscan", *CLAMSCAN_BASE, "--",
                      chunk_dir],
                     capture_output=True, text=True, timeout=900 * chunk_count)
         except FileNotFoundError:
@@ -184,9 +207,7 @@ def clamav_check(path: Path) -> tuple[bool, str]:
 
     try:
         result = subprocess.run(
-            ["clamscan", "--no-summary", "--stdout", "--infected",
-             "--alert-exceeds-max=yes", "--max-filesize=0", "--max-scansize=0",
-             "--max-scantime=0",
+            ["clamscan", *CLAMSCAN_BASE,
              "--", str(path)],
             capture_output=True, text=True, timeout=900)
     except FileNotFoundError:
@@ -206,7 +227,13 @@ def clamav_check(path: Path) -> tuple[bool, str]:
 
 
 def validate_media(path: Path) -> tuple[str, str]:
-    """Run cheap format rejection first, then antivirus validation."""
+    """Run cheap format rejection first, then antivirus validation.
+
+    A clamscan rc=1 whose detail contains ``Heuristics.Limits.Exceeded`` is
+    a resource-cap notice, NOT malware — return the retryable ``scan-limit``
+    outcome. Only genuine signature hits stay ``malware-detected``.
+    Scanner errors/timeouts stay fail-closed (``scan-failed``).
+    """
     valid_format, detail = format_gate(path)
     if not valid_format:
         return "format-failed", detail
@@ -214,6 +241,8 @@ def validate_media(path: Path) -> tuple[str, str]:
     if not clean:
         if "scanner error" in detail.lower() or "not installed" in detail.lower():
             return "scan-failed", detail
+        if "Heuristics.Limits.Exceeded" in detail:
+            return SCAN_LIMIT_STAGE, detail
         return "malware-detected", detail
     return "clean", detail
 
@@ -343,13 +372,26 @@ def library_files_by_size() -> dict[int, list[Path]]:
     return out
 
 
+# In-process sha256 cache keyed by (path, size, mtime). The script is
+# spawned per pass so the cache need not persist; it avoids re-hashing GBs
+# when the same payload is sighted twice in one pass (scan + identity
+# checks each hash the source and every equal-sized library candidate).
+_SHA256_CACHE: dict[tuple[str, int, int], str] = {}
+
+
 def sha256_of(p: Path) -> str:
     import hashlib
-    h = hashlib.sha256()
-    with p.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(8 * 1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    st = p.stat()
+    key = (str(p), st.st_size, int(st.st_mtime))
+    cached = _SHA256_CACHE.get(key)
+    if cached is None:
+        h = hashlib.sha256()
+        with p.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(8 * 1024 * 1024), b""):
+                h.update(chunk)
+        cached = h.hexdigest()
+        _SHA256_CACHE[key] = cached
+    return cached
 
 
 def film_identity_verified(v: Path, by_size: dict[int, list[Path]]) -> bool:
@@ -505,23 +547,26 @@ def promote_item(item: Path, state: dict, dry: bool) -> None:
     st = state.setdefault(name, {})
     stage = st.get("stage")
 
-    # source-change invalidation: a re-downloaded/replaced item is a new item.
-    # This applies to successful gates too: replacing bytes after validation
-    # must never inherit an earlier clean result.
+    # In-flight items return BEFORE the source-change reset: bytes under an
+    # active download always differ, and resetting terminal state mid-download
+    # just burns AV/decode cycles and spams the log. Source-change
+    # invalidation applies only once the control file is gone.
     vids = video_files_of(item)
     sig = source_signature(vids) if vids else None
+    if has_control_file(item):
+        return  # still downloading or restarted; not our turn
     recorded_sig = st.get("validation_source_sig") or st.get("source_sig")
     if sig and recorded_sig not in (None, sig):
         log(f"source changed since {stage or 'validation'}: {name} — resetting")
         st.clear()
         stage = None
 
+    # NOTE: "scan-limit" is intentionally absent here — it is retryable, not
+    # terminal, so the next pass re-scans automatically without --force.
     if stage in ("done", "book-noted", "skipped", "format-failed",
                  "malware-detected", "scan-failed", "decode-failed",
                  "promote-failed", "skipped-no-video", "superseded-duplicate"):
         return
-    if has_control_file(item):
-        return  # still downloading or restarted; not our turn
 
     if item.suffix.lower() in BOOK_EXTS:
         log(f"book item (reported only, never promoted): {name}")
@@ -542,9 +587,26 @@ def promote_item(item: Path, state: dict, dry: bool) -> None:
     # ── 0. Security gate every payload before promotion or duplicate cleanup.
     # Old decode-checked/promoted journal entries intentionally have no
     # validation_source_sig, so they receive the new gate on their next pass.
-    if st.get("validation_source_sig") != sig:
+    # Identity-verified re-sight: a byte-identical re-sight of an
+    # already-cleared payload (validation sig matches AND sha256 identity
+    # against the library holds) skips ClamAV AND decode and proceeds
+    # straight to the duplicate-gate logic below — no multi-minute re-scan.
+    skip_gates = False
+    by_size_pre: dict | None = None
+    if sig and st.get("validation_source_sig") == sig and vids:
+        by_size_pre = library_files_by_size()
+        if all(film_identity_verified(v, by_size_pre) for v in vids):
+            log(f"  identity-verified re-sight, skipping scan+decode: {name}")
+            skip_gates = True
+    if st.get("validation_source_sig") != sig and not skip_gates:
         for v in vids:
             status, detail = validate_media(v)
+            if status == SCAN_LIMIT_STAGE:
+                log(f"SCAN-LIMIT {name}: {v.name} — {detail}; will retry next pass")
+                st.update(stage=SCAN_LIMIT_STAGE, source_sig=sig, at=time.time(),
+                          validation_detail=detail)
+                save_state(state)
+                return
             if status != "clean":
                 label = status.upper()
                 log(f"{label} {name}: {v.name} — {detail}; NOT promoted")
@@ -560,7 +622,7 @@ def promote_item(item: Path, state: dict, dry: bool) -> None:
     # ── 1. pre-promote duplicate check: if the library ALREADY holds an
     # identity-verified copy of every video, skip promotion (a twin folder
     # would be created) and go straight to clearing the duplicate.
-    by_size0 = library_files_by_size()
+    by_size0 = by_size_pre if by_size_pre is not None else library_files_by_size()
     if all(film_identity_verified(v, by_size0) for v in vids):
         log(f"already in library (identity-verified) — clearing duplicate: {name}")
         if delete_verified_files(item, vids, by_size0):
@@ -572,8 +634,10 @@ def promote_item(item: Path, state: dict, dry: bool) -> None:
             save_state(state)
         return
 
-    # ── 2. decode-check every video BEFORE promotion (skip if already done)
-    if stage not in ("promoted", "decode-checked"):
+    # ── 2. decode-check every video BEFORE promotion (skip if already done,
+    # or if this pass is an identity-verified re-sight heading straight for
+    # the duplicate gate)
+    if not skip_gates and stage not in ("promoted", "decode-checked"):
         sig = source_signature(vids)
         for v in vids:
             if not decode_check(v):
@@ -661,6 +725,32 @@ def promote_item(item: Path, state: dict, dry: bool) -> None:
     save_state(state)
 
 
+# Success / progress / policy stages are history worth keeping even after
+# the dock copy clears (the normal lifecycle ends with the dock dir gone),
+# so only failure/ghost rows are reapable. Reaping "done" would destroy the
+# completion journal; "promoted" is the resumable record of a rc=0 promote.
+REAPABLE_STAGES = ("format-failed", "malware-detected", "scan-failed",
+                   SCAN_LIMIT_STAGE, "decode-failed", "promote-failed",
+                   "skipped-no-video", None)  # None = no-stage ghost
+
+
+def reap_stale_states(state: dict, dock: Path = DOCK) -> int:
+    """Drop failure/ghost state entries whose dock path no longer exists
+    (stale journal: decode-failed on cleared files, ghost no-stage rows).
+    Success/policy stages (done, promoted, superseded-duplicate, skipped,
+    book-noted, decode-checked) are preserved as history. One log line per
+    reap. Returns the number of entries reaped."""
+    reaped = 0
+    for name in list(state.keys()):
+        entry = state[name]
+        stage = entry.get("stage") if isinstance(entry, dict) else None
+        if stage in REAPABLE_STAGES and not (dock / name).exists():
+            log(f"reaped stale state (dock path gone): {name} (was {stage})")
+            del state[name]
+            reaped += 1
+    return reaped
+
+
 def main() -> None:
     args = sys.argv[1:]
     dry = "--dry-run" in args
@@ -693,6 +783,8 @@ def main() -> None:
         return
 
     state = load_state()
+    if reap_stale_states(state):
+        save_state(state)
 
     if force_item:
         # audit finding 13: only DIRECT children of the dock, no traversal
@@ -704,10 +796,7 @@ def main() -> None:
             log(f"force target not a dock child or not found: {force_item}")
             sys.exit(2)
         st = state.setdefault(force_item, {})
-        if st.get("stage") in ("format-failed", "malware-detected",
-                               "scan-failed", "decode-failed",
-                               "promote-failed", "skipped-no-video", "done",
-                               "superseded-duplicate"):
+        if st.get("stage") in FORCE_RESET_STAGES:
             log(f"resetting state for {force_item} (was {st.get('stage')})")
             st.clear()
         promote_item(target, state, dry=False)
